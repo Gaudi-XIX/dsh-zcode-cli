@@ -147,6 +147,18 @@ ZCode 0.17.0 需要五项环境变量，缺任一项会在启动 714 ms 内以�
 
 `stderrTail` 一律截断到 2048 字符（`STDERR_TAIL_MAX_CHARS`），报告里只出现有界片段。
 
+`providerCode` 的类型是**数字**（`ZcodeError.providerCode?: number`）：`[1309]` 解析为 `1309`，不是字符串 `'1309'`；没有数字码时字段缺席（`undefined`），调用方按 `=== 1309` 比较。
+
+`responseStatus` 的来源是三种 stderr 形状（`HTTP_STATUS` 正则），都只接受**三位数字 + 右词边界**，再经 `100..599` 范围校验：
+
+| 形状 | 例子 |
+|---|---|
+| `HTTP <n>` | `HTTP 429` |
+| `status` / `status code`，分隔符 `:` 或 `=` | `status: 429`、`status code 429` |
+| `responseStatus`，分隔符 `:` 或 `=`，可带空格 | `responseStatus: 429`、`responseStatus=429` |
+
+`responseStatus` 前的 `\b` 由 `HTTP` / `status` 自身承担，不能放在 `status` 之前——真实 stderr 里是 `responseStatus: 429`，`Status` 前一个字符是单词字符 `e`，放在前面就永远匹配不到。`providerCode: 1309`、`request-id` 里的长数字串**不得**被当成状态码（负向断言见 `tests/error-codes.test.mjs`）。判定顺序不变：`providerCode 1309` 命中 `QUOTA` 在前，因此「1309 + 429」报 `QUOTA` 而不是 `RATE_LIMIT`。
+
 ## 模型目录
 
 静态双模型（design D2），实测自 ZCode 0.17.0 的 configured providers：
@@ -204,3 +216,4 @@ ZCode 0.17.0 需要五项环境变量，缺任一项会在启动 714 ms 内以�
 - **L4 未验证 150% 计费**：产品目标要求的倍率没有服务端账单读数，**禁止用本地文件推断计费**。
 - **L5 不判权益**：doctor 与运行时都不判断套餐状态，1309 只作为历史观测记录。
 - **L6 错误码语义待校准**：`3007` / `3012` 的真实语义（风控还是权限）未核对，映射可能需微调。
+- **L7 `--cwd` 只能是宿主目录**：`GenerateOptions` 不带 workspace 字段，adapter 拿不到会话的工作目录，子进程因此继承 `process.cwd()`（宿主目录）。需要「按工作区切 cwd」得先在宿主侧加一条传递路径，本版没有。

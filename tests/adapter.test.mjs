@@ -15,6 +15,7 @@ import test, { before, after } from 'node:test'
 
 import { EMPTY_RESPONSE_CODE } from '@deepseek-ai/dsh-llm'
 import { ZcodeAdapter } from '../lib/provider/zcode.js'
+import { clearQuotaObservation, lastQuotaObservation } from '../lib/diagnostics.js'
 import { ZCODE_ENV_CONTRACT, missingEnvKeys } from '../lib/zcode/process.js'
 
 /**
@@ -249,14 +250,33 @@ test('a permission request fails closed with its own code', async t => {
 })
 
 test('a quota exit keeps providerCode and request-id in the failure', async t => {
+  // The quota recollector is process-wide, so the test owns its starting state:
+  // this asserts the adapter *wrote* a record, not that one happened to exist.
+  clearQuotaObservation()
+  assert.equal(lastQuotaObservation(), null)
+
   const chunks = await collect(adapter(t).stream(request('@@quota@@')))
   const failure = terminalFailure(chunks)
   assert.equal(failure?.code, 'QUOTA')
-  // The capture prints `responseStatus: 429`, which the status reader does not
-  // accept; the provider code is the precise fact and it is kept verbatim.
-  assert.equal(failure.status, undefined)
+  // The capture prints `responseStatus: 429`; since W4 fixed the status reader
+  // that shape is read, so the failure carries the HTTP status too.
+  assert.equal(failure.status, 429)
   assert.match(failure.message, /providerCode=1309/)
+  assert.match(failure.message, /responseStatus=429/)
   assert.match(failure.message, /request-id=2026102401123552bbdbe6a99a4f3d/)
+
+  // Same run, second surface: the adapter also hands the rejection to
+  // `diagnostics`, which is what `doctor`'s `last-quota` check reports. The
+  // observation is deliberately asserted here rather than in
+  // `tests/doctor.test.mjs`, because only this file drives the real 1309
+  // failure through `ZcodeAdapter.stream()`; the doctor test injects a record
+  // and would pass even with this wiring missing.
+  const observed = lastQuotaObservation()
+  assert.equal(observed?.providerCode, '1309')
+  assert.equal(observed?.requestId, '2026102401123552bbdbe6a99a4f3d')
+  assert.match(observed?.observedAt ?? '', /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
+  // Recording must not add or reorder frames: still one terminal finish.
+  assert.equal(chunks.at(-1).reason.kind, 'error')
 })
 
 test('an in-band error frame and a stderr exit agree on the code', async t => {

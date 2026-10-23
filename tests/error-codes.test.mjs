@@ -66,14 +66,40 @@ test('AC6: 1309 classifies as QUOTA and keeps providerCode + request-id', () => 
   assert.equal(error.providerCode, 1309)
   assert.match(error.providerMessage ?? '', /套餐已到期/)
   assert.equal(error.requestId, '2026102401123552bbdbe6a99a4f3d')
-  // The capture prints `responseStatus: 429`, which is *not* the shape the
-  // status reader accepts (`HTTP 429` / `status 429`), so nothing is claimed:
-  // the provider code already names the condition precisely.
-  assert.equal(error.responseStatus, undefined)
+  // `responseStatus: 429` is the object-field shape the classifier reads: the
+  // word is glued to `response`, which is exactly the shape a `\bstatus`
+  // pattern silently dropped before W4 fixed it.
+  assert.equal(error.responseStatus, 429)
   // The message is built by the classifier, not copied: it must name the
   // condition a user can act on, and keep the provider message attached.
   assert.match(error.message, /quota/i)
   assert.match(error.message, /套餐已到期/)
+})
+
+test('the status reader accepts HTTP, status and responseStatus shapes only', () => {
+  const status = stderr => classifyStderr(stderr, { exitCode: 1 }).responseStatus
+
+  // Shape 1: the bare transport line.
+  assert.equal(status('HTTP 429 Too Many Requests'), 429)
+  assert.equal(status('HTTP 401 Unauthorized'), 401)
+  // Shape 2: the CLI's own wording, with and without `code`.
+  assert.equal(status('status: 429'), 429)
+  assert.equal(status('status code 429'), 429)
+  assert.equal(status('Status Code: 502'), 502)
+  // Shape 3: the dump field, `:` or `=` and either spacing.
+  assert.equal(status('responseStatus: 429'), 429)
+  assert.equal(status('responseStatus=429'), 429)
+  assert.equal(status('responseStatus = 429'), 429)
+  // The real capture, byte for byte (see QUOTA_STDERR): its 429 sits behind a
+  // fixed-width provider code, so the reader must not pick up `1309` instead.
+  assert.equal(status(QUOTA_STDERR), 429)
+
+  // Strictness kept: three digits with a word boundary, punctuation-only
+  // separators, and no match on an unrelated four-digit provider code.
+  assert.equal(status('responseStatus: 4290'), undefined)
+  assert.equal(status('status: 42'), undefined)
+  assert.equal(status('status of the run: 500'), undefined)
+  assert.equal(status('providerCode: 1309'), undefined)
 })
 
 test('3007 classifies as RATE_LIMIT and 3012 as PERMISSION_REQUIRED', () => {

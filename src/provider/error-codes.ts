@@ -126,8 +126,21 @@ const PROVIDER_PREFIX = /\[(\d{4})\]\[([^\]]+)\]\[([^\]]+)\]/
 /** `--verbose` prints the underlying transport failure on a `Cause:` line. */
 const VERBOSE_CAUSE = /^\s*Cause:\s*(.+)$/m
 
-/** HTTP status as printed by the CLI or the embedded client. */
-const HTTP_STATUS = /\b(?:HTTP|status(?:\s+code)?)\D{0,3}(\d{3})\b/i
+/**
+ * HTTP status as printed by the CLI or the embedded client.
+ *
+ * Three shapes are real: `HTTP 429`, `status: 429` / `status code: 429`, and the
+ * object field a `PROVIDER_BUSINESS_ERROR` dump carries, `responseStatus: 429`
+ * (or `responseStatus=429`). The keyword deliberately has no `\b` in front of
+ * `status`: in the dump the word is glued to `response`, so `\bstatus` never
+ * holds there and the real 429 used to be dropped.
+ *
+ * Strictness is unchanged: the separator budget holds punctuation and spaces
+ * only (never letters), so this cannot drift into "any number near the word
+ * status", and the payload stays exactly three digits with a trailing word
+ * boundary (`4290` is not a status).
+ */
+const HTTP_STATUS = /\b(?:HTTP|(?:response)?status(?:[\s_-]*code)?)[\s:=,-]{0,4}(\d{3})\b/i
 
 const QUIET_KEY = 1309
 const RATE_LIMIT_KEY = 3007

@@ -121,6 +121,7 @@ import {
   type ZcodeToolPolicy,
 } from './config.js'
 import { ZcodeError, isZcodeError } from './error-codes.js'
+import { QUOTA_PROVIDER_CODE, recordQuotaObservation } from '../diagnostics.js'
 import { FileSessionStore, sessionStorePath } from '../session/file-store.js'
 import { SessionRegistry } from '../session/store.js'
 import { runZcode, type ZcodeProcessConfig } from '../zcode/process.js'
@@ -494,6 +495,7 @@ export class ZcodeAdapter extends LlmAdapter {
             }
             case 'error': {
               // Kept for the terminal chunk; the kill switch is already armed.
+              this.noteQuotaObservation(frame.error)
               failure ??= toLlmFailure(frame.error)
               break
             }
@@ -607,8 +609,25 @@ export class ZcodeAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * Remember a provider-side quota rejection for the diagnostics surface.
+   *
+   * Recording only: the failure keeps travelling through {@link toLlmFailure}
+   * into the terminal `finish` chunk exactly as before, and this cannot throw —
+   * the diagnostics layer holds one module-level record. Without this call
+   * `doctor`'s `last-quota` check could only ever say "nothing observed in this
+   * process", even right after a real 1309.
+   */
+  private noteQuotaObservation(error: ZcodeError): void {
+    if (error.code !== 'QUOTA' || error.providerCode === undefined) return
+    const providerCode = String(error.providerCode)
+    if (providerCode !== QUOTA_PROVIDER_CODE) return
+    recordQuotaObservation({ providerCode, requestId: error.requestId })
+  }
+
   /** Map a process-layer failure, keeping a caller cancellation distinguishable. */
   private processFailure(error: unknown, abortCause: AbortCause | undefined, resume: boolean): LlmFailure {
+    if (isZcodeError(error)) this.noteQuotaObservation(error)
     const failure = isZcodeError(error) ? toLlmFailure(error) : {
       code: 'ZCODE_UNKNOWN' as const,
       message: error instanceof Error ? error.message : String(error),
