@@ -14,9 +14,12 @@
 
     Default behaviour is a dry run: it prints every key, the current value, the
     value it would write, and whether each path is present. -Apply is the only
-    way anything is written. Existing NODE_OPTIONS is extended, never replaced:
-    the two DNS flags are appended only when missing, so other flags the user
-    set stay in place.
+    way anything is written. NODE_OPTIONS is never replaced: the value offered
+    for it is the current user value plus whichever of the two DNS flags are
+    missing, so flags the user set stay in place. Without -Force that merged
+    value is only written when it equals what is already there (otherwise the
+    variable is skipped with a WARNING); with -Force the merged value replaces
+    the current one, keeping the user's other flags.
 
     -Apply never overwrites an existing value that differs from the plan: it
     prints a WARNING and skips that variable, so a user whose environment was
@@ -172,7 +175,11 @@ if ($Apply) {
 }
 
 if ($warnings -gt 0) {
-    Write-Host ('{0} path warning(s): the variables are set, but the provider will still fail until the paths exist.' -f $warnings)
+    if ($Apply) {
+        Write-Host ('{0} path warning(s): the values were written, but the provider will still fail until the paths exist.' -f $warnings)
+    } else {
+        Write-Host ('{0} path warning(s): nothing was written (dry run); -Apply would write values pointing at paths that do not exist.' -f $warnings)
+    }
 }
 
 Write-Host 'Restart DSH before retrying a ZCode request (environment is read at spawn time, not per request).'

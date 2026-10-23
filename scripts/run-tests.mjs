@@ -9,7 +9,7 @@
  * Windows resolves `tsc.cmd`.
  */
 
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { dirname, extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -75,13 +75,23 @@ const EXPECTED_TEST_FILES = [
 ]
 
 /**
+ * The number of cases `node --test` must report.
+ *
+ * The file list above cannot see inside a file: deleting one `test()` block left
+ * 124 cases green, because a smaller suite passes just as well. This constant is
+ * the second lock, and it has to agree with the `测试用例` line in
+ * `docs/dsh-provider-contract.md` and with the summary `node --test` prints.
+ * Adding or removing a case means updating all three.
+ */
+const EXPECTED_TEST_CASES = 131
+
+/**
  * Recursively collect `*.test.mjs` under the tests directory.
  *
  * @param {string} directory - Absolute directory to walk.
  * @returns {string[]} Absolute paths, slash-normalised for comparison.
  */
-function discoverTests(directory) {
-  const found = []
+function discoverTests(directory) {  const found = []
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const full = join(directory, entry.name)
     if (entry.isDirectory()) {
@@ -118,6 +128,71 @@ function declaredControlledFileCount() {
   if (!existsSync(document)) return undefined
   const match = readFileSync(document, 'utf8').match(/受控文件：[^\n]*共 \*\*(\d+)\*\*/)
   return match === undefined || match === null ? undefined : Number.parseInt(match[1], 10)
+}
+
+/**
+ * The test-case count the contract doc declares, when present.
+ *
+ * @returns {number | undefined} The declared count.
+ */
+function declaredCaseCount() {
+  const document = join(root, 'docs', 'dsh-provider-contract.md')
+  if (!existsSync(document)) return undefined
+  const match = readFileSync(document, 'utf8').match(/测试用例：[^\n]*共 \*\*(\d+)\*\*/)
+  return match === undefined || match === null ? undefined : Number.parseInt(match[1], 10)
+}
+
+/**
+ * Run one step while echoing what it prints, and keep a copy of that output.
+ *
+ * `spawnSync` with inherited stdio can either stream *or* hand the text back, and
+ * the case-count lock needs the `ℹ tests N` summary line. Streaming the copy as
+ * it arrives keeps a mid-run failure readable.
+ *
+ * @param {string} label - Human-readable step name.
+ * @param {readonly string[]} args - Arguments for `node`.
+ * @returns {Promise<{ ok: boolean, output: string }>} Whether it exited 0, and
+ *   everything it wrote to stdout.
+ */
+function stepCaptured(label, args) {
+  return new Promise(resolveStep => {
+    process.stdout.write(`\n── ${label}\n`)
+    const child = spawn(process.execPath, args, { cwd: root, stdio: ['inherit', 'pipe', 'inherit'] })
+    let output = ''
+    let spawnError
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', chunk => {
+      output += chunk
+      process.stdout.write(chunk)
+    })
+    child.on('error', error => {
+      spawnError = error
+    })
+    child.on('close', code => {
+      if (spawnError !== undefined) {
+        process.stderr.write(`${label} could not start: ${spawnError.message}\n`)
+        resolveStep({ ok: false, output })
+        return
+      }
+      if (code !== 0) process.stderr.write(`\n${label} failed (exit ${String(code)})\n`)
+      resolveStep({ ok: code === 0, output })
+    })
+  })
+}
+
+/**
+ * The case total `node --test` prints in its summary block.
+ *
+ * Read from the reporter output rather than from the file list: only the summary
+ * knows how many `test()` blocks actually ran, which is the point of the lock.
+ *
+ * @param {string} output - Everything the test step wrote to stdout.
+ * @returns {number | undefined} `undefined` when the summary line is absent.
+ */
+function reportedCaseCount(output) {
+  const plain = output.replace(/\u001b\[[0-9;]*m/g, '')
+  const match = plain.match(/^\s*\u2139\s+tests\s+(\d+)\s*$/mu)
+  return match === null ? undefined : Number.parseInt(match[1], 10)
 }
 
 /**
@@ -293,6 +368,43 @@ if (missing.length > 0 || extra.length > 0) {
 process.stdout.write(`  ${names.length} test files match the declared corpus\n`)
 
 // `--test-reporter=spec` keeps the per-test lines readable when the suite grows.
-const ok = step('tests', ['--test', '--test-reporter=spec', ...files])
+const observed = await stepCaptured('tests', ['--test', '--test-reporter=spec', ...files])
+let ok = observed.ok
+
+if (ok) {
+  // The file list is blind to what happens *inside* a file: a deleted `test()`
+  // block leaves a suite that still passes, just smaller. The summary line is the
+  // only place the real case total shows up, so it is compared against both the
+  // script constant and the declaration reviewers read.
+  const cases = reportedCaseCount(observed.output)
+  const declaredCases = declaredCaseCount()
+  if (cases === undefined) {
+    process.stderr.write(
+      'could not read the "ℹ tests N" summary line out of the node --test output; '
+      + 'refusing to report success without the test-case count.\n',
+    )
+    ok = false
+  } else if (declaredCases === undefined) {
+    process.stderr.write(
+      'docs/dsh-provider-contract.md is missing the "测试用例：… 共 **N**" declaration; '
+      + 'refusing to guess the expected test-case count.\n',
+    )
+    ok = false
+  } else if (EXPECTED_TEST_CASES !== cases) {
+    process.stderr.write(
+      `test case count drift: expected ${EXPECTED_TEST_CASES} (EXPECTED_TEST_CASES in this script), `
+      + `node --test reported ${cases}\n`,
+    )
+    ok = false
+  } else if (declaredCases !== cases) {
+    process.stderr.write(
+      `test case count drift: docs declare ${declaredCases}, node --test reported ${cases}\n`,
+    )
+    ok = false
+  } else {
+    process.stdout.write(`  ${cases} test cases match the declaration\n`)
+  }
+}
+
 process.stdout.write(ok ? '\nall gates passed\n' : '\nthe gate is red\n')
 process.exit(ok ? 0 : 1)

@@ -26,7 +26,7 @@ DSH 的 ZCode provider：把本机 `zcode.cjs`（ZCode 0.17.0）作为一个 `zc
 node scripts/run-tests.mjs    # AC11 行尾 → tsc --noEmit → build → 包入口点 → 测试面计数 → node --test
 ```
 
-`tests/` 下 8 个 `*.test.mjs`；脚本里的显式清单、`docs/dsh-provider-contract.md` 的「测试面」计数与磁盘实点三者必须一致，否则门禁在跑测试前就停。
+`tests/` 下 9 个 `*.test.mjs`；脚本里的显式清单、`docs/dsh-provider-contract.md` 的「测试面」计数与磁盘实点三者必须一致，否则门禁在跑测试前就停。用例总数同样锁死（`EXPECTED_TEST_CASES` 与文档「测试用例」行），删掉一个 `test()` 块也会让门禁变红。
 
 ## 已知限制（摘要）
 

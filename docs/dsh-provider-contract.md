@@ -105,7 +105,7 @@ finish(stop | length | error)
 
 ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provider 在 spawn 时自己注入**的 `NODE_OPTIONS`。插件不做推导、不设默认值，在 spawn 之前检查（`assertEnvContract()`）：
 
-| 变量 | 提供方 | 本机取值（2026-10-24 实测） | 缺失后果 |
+| 变量 | 提供方 | 期望取值（变量当前未设置；四个路径本机实测存在） | 缺失后果 |
 |---|---|---|---|
 | `ZCODE_HOME` | 宿主 | `F:\AgentData\zcode\data\.zcode` | 无法创建 store manager，启动期退出 |
 | `ZCODE_DATA_BASE_DIR` | 宿主 | `F:\AgentData\zcode\data` | 同一 bootstrap 步骤失败 |
@@ -119,7 +119,7 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 
 **子进程环境是闭集**（`buildChildEnv()`）：只取 `PATH`、`SystemRoot`、`SystemDrive`、`windir`、`TEMP`、`TMP`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`COMSPEC`、`PATHEXT`，加上上面五项契约值与 `config.passEnv` 显式列出的变量名。宿主其他变量（含各种 API key / token）不会进入子进程；测试用 `SECRET_CANARY` 断言这一点。
 
-写入路径变量用 `scripts/install-env.ps1`（默认 dry-run，`-Apply` 才写用户级变量）。`-Apply` 遇到「已存在且与目标值不同」的变量会 **WARNING 并跳过**，只有再加 `-Force` 才覆盖——避免脚本一跑就把用户自己的 `NODE_OPTIONS` 冲掉。`NODE_OPTIONS` 不必再写用户级变量：provider 在 spawn 时注入。写完仍需**重启 DSH**（宿主环境在启动时读一次）。
+写入路径变量用 `scripts/install-env.ps1`（默认 dry-run，`-Apply` 才写用户级变量）。`-Apply` 遇到「已存在且与目标值不同」的变量会 **WARNING 并跳过**，只有再加 `-Force` 才覆盖——避免脚本一跑就把用户自己的 `NODE_OPTIONS` 冲掉；`NODE_OPTIONS` 例外：脚本给出的候选值本身就是「现有值 + 缺失的 DNS flag」，`-Force` 写下去的是这个合并值，用户其他 flag 仍在。`NODE_OPTIONS` 也不必再写用户级变量：provider 在 spawn 时注入。写完仍需**重启 DSH**（宿主环境在启动时读一次）。
 
 ## argv 契约
 
@@ -148,8 +148,7 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 | `MODEL_NOT_FOUND` | ZCode 不认识请求的模型 | 否 |
 | `ZCODE_PARSE` | stdout/帧解析失败 | 否 |
 | `ZCODE_EXIT` | 非零退出 | 是 |
-| `ZCODE_UNKNOWN` | 未识别的失败 | 是 |
-| `TIMEOUT` | 墙钟或空闲超时 | 是 |
+| `ZCODE_UNKNOWN` | 未识别的失败 | 是 || `TIMEOUT` | 墙钟或空闲超时 | 是 |
 | `ABORTED` | 调用方取消 | 否 |
 | `UNSUPPORTED_TOOLS` | 请求携带了本模式不接受的 tools | 否 |
 | `UNSUPPORTED_OPTION` | 请求携带 `temperature` / `maxTokens` / 非空 `stop` | 否 |
@@ -159,6 +158,10 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 | `WORKSPACE_UNAVAILABLE` | 解析不到会话 workspace 根 | 否 —— 需宿主侧修数据 |
 
 `ZCODE_BUSY` 与 `ZCODE_OUTPUT_TOO_LARGE` 刻意**不在**重试白名单、也**不在** `DROPS_SESSION_ON`：前者是排队拥塞，重试只会放大；后者说明输出契约被违反，换一次 spawn 也还是超限。两者也不丢 session id——session 没坏，坏的是这一次调用的形态。
+
+`DROPS_SESSION_ON` 现只含 `ZCODE_EXIT` 与 `ZCODE_UNKNOWN`，且两者都由进程层的 `processFailure` 产出：子进程真的死了、或失败形态无法识别，服务端那一侧的状态无从判断，留着旧 id 只会让下一轮带着一个可能已失效的 id 再花一次调用。
+
+`ZCODE_PARSE` **不在**该集合内。它只由「进程干净退出但 stdout 没有任何可识别文本帧」的空答分支产生，而进程层从不抛它，所以 `processFailure` 永远观察不到这个码；更关键的是干净退出说明服务端会话是好的，缺口在这侧解析器——而这个解析器至今没捕获过一次真实成功的 stdout（finding F-1）。在这里忘记 id，等于在证据最薄弱的地方销毁一个没人证明坏掉的会话。
 
 `stderrTail` 一律截断到 2048 字符（`STDERR_TAIL_MAX_CHARS`），报告里只出现有界片段。诊断文本（`message` / `providerMessage`）另经 `sanitizeSecrets()` 脱敏（`Bearer …`、`?token=…`/`&sig=…` 查询参数、`sk-…` 形态的 key）并截断到 4 KiB（`DIAGNOSTIC_MAX_CHARS`）。
 
@@ -225,11 +228,13 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 
 ## 门禁
 
-`node scripts/run-tests.mjs` 是唯一入口，顺序固定：AC11（`src/`、`tests/`、`scripts/`、`docs/` 与根级文本文件全部 LF、无 BOM）→ `tsc --noEmit` → `tsc`（build）→ 包入口点（`main` / `types` / `exports` / `dsh.bundle.patch` 指向的文件存在，且 `dependencies` 为空）→ 测试面计数 → `node --test`。
+`node scripts/run-tests.mjs` 是唯一入口，顺序固定：AC11（`src/`、`tests/`、`scripts/`、`docs/` 与根级文本文件全部 LF、无 BOM）→ `tsc --noEmit` → `tsc`（build）→ 包入口点（`main` / `types` / `exports` / `dsh.bundle.patch` 指向的文件存在，且 `dependencies` 为空）→ 测试面计数 → `node --test` → 用例数核对。
 
 测试面：`tests/` 下递归共 **9** 个 `*.test.mjs`，必须与脚本里的 `EXPECTED_TEST_FILES` 集合相等，也必须等于本行声明的数字（`declaredTestCount()` 解析本行）。少一个、多一个、改名一个都会让门禁在跑测试前就停——不允许「测试变少、门禁仍绿」。
 
-受控文件：`git ls-files` 共 **27** 个（9 个测试 + 8 个 `src/**` 源文件 + 脚本、文档、配置、README）。门禁会拿 `git ls-files` 的实点数与这一行比对，改文件数必须同步改这行。
+测试用例：`node --test` 汇总的用例总数共 **131** 个（`ℹ tests 131`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
+
+受控文件：`git ls-files` 共 **27** 个 = 10 个 `src/**` 源文件（`index.ts`、`diagnostics.ts`、`doctor.ts`、`provider/{config,error-codes,zcode}.ts`、`session/{file-store,store}.ts`、`zcode/{parser,process}.ts`）+ 9 个 `tests/**/*.test.mjs` + 2 个 `scripts/`（`run-tests.mjs`、`install-env.ps1`）+ 1 个 `docs/dsh-provider-contract.md` + 5 个根级文件（`.gitignore`、`README.md`、`cordis.patch.yml`、`package.json`、`tsconfig.json`）。门禁会拿 `git ls-files` 的实点数与这一行比对，改文件数必须同步改这行。
 
 ## 已知限制
 

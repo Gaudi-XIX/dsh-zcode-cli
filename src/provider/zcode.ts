@@ -850,8 +850,15 @@ export class ZcodeAdapter extends LlmAdapter {
  * `QUOTA`, `RATE_LIMIT`, `AUTH`, `TIMEOUT` and `ABORTED` all describe the
  * account or the transport, so the id stays: dropping it would throw away a
  * still-valid session because of a transient condition.
+ *
+ * `ZCODE_PARSE` is deliberately absent. It is produced only by the clean-exit
+ * branch that saw no recognizable text frame, and the process layer never
+ * raises it, so `processFailure` cannot observe it at all. A clean exit leaves
+ * the server-side session intact — the gap is in this parser, which has never
+ * seen a successful stdout (finding F-1) — so forgetting the id there would
+ * destroy a session nothing proves broken.
  */
-const DROPS_SESSION_ON: ReadonlySet<string> = new Set(['ZCODE_EXIT', 'ZCODE_PARSE', 'ZCODE_UNKNOWN'])
+const DROPS_SESSION_ON: ReadonlySet<string> = new Set(['ZCODE_EXIT', 'ZCODE_UNKNOWN'])
 
 /**
  * Request fields this route has no channel for, rendered for the failure

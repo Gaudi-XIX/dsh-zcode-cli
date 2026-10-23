@@ -210,3 +210,64 @@ test('registration has no boot-time side effects: no env read, no process, no fi
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+/**
+ * `createWorkspaceRootResolver` is the only place that turns a conversation into
+ * a `--cwd`, and the adapter turns `undefined` into `WORKSPACE_UNAVAILABLE`. The
+ * two tests below pin both halves: the happy path must answer with the registry
+ * root of *this* session, and every broken link must answer `undefined` instead
+ * of falling back to `process.cwd()` (the DSH install directory, not the user's
+ * project). Losing either one is how a provider silently writes into the
+ * installation folder; the doc states the rule, these tests make it fail.
+ */
+test('B2: the workspace resolver answers with the session registry root, not the process cwd', async () => {
+  const asked = []
+  const ctx = {
+    sessions: {
+      get: id => (id === 'conversation-ws' ? { header: { cwd: 'F:\\defws\\project' } } : undefined),
+    },
+    workspaceRegistry: {
+      resolveByPath: async path => {
+        asked.push(path)
+        return { path: 'F:\\defws\\project\\workspace', status: async () => 'ok' }
+      },
+    },
+  }
+
+  const resolver = plugin.createWorkspaceRootResolver(ctx)
+  const root = await resolver('conversation-ws')
+
+  assert.equal(root, 'F:\\defws\\project\\workspace')
+  assert.deepEqual(asked, ['F:\\defws\\project'], 'the registry must be asked about this session\'s cwd')
+  assert.notEqual(root, process.cwd(), 'a resolver that returned process.cwd() would run the CLI in the DSH install')
+})
+
+test('B2: the workspace resolver fails closed on every broken link, never to the process cwd', async () => {
+  const cwd = 'F:\\defws\\project'
+  const session = () => ({ header: { cwd } })
+  const ok = () => ({ path: 'F:\\defws\\project\\workspace', status: async () => 'ok' })
+  const cases = [
+    ['no host services at all', {}],
+    ['no registry', { sessions: { get: session } }],
+    ['an unknown conversation', { sessions: { get: () => undefined }, workspaceRegistry: { resolveByPath: async ok2 => ok() } }],
+    ['a blank recorded cwd', { sessions: { get: () => ({ header: { cwd: '  ' } }) }, workspaceRegistry: { resolveByPath: async () => ok() } }],
+    ['a registry that resolves nothing', { sessions: { get: session }, workspaceRegistry: { resolveByPath: async () => undefined } }],
+    ['a registry without resolveByPath', { sessions: { get: session }, workspaceRegistry: {} }],
+    ['a workspace whose status is not ok', { sessions: { get: session }, workspaceRegistry: { resolveByPath: async () => ({ ...ok(), status: async () => 'deleted' }) } }],
+  ]
+
+  for (const [label, ctx] of cases) {
+    const resolver = plugin.createWorkspaceRootResolver(ctx)
+    const resolved = await resolver('conversation-ws')
+    assert.equal(resolved, undefined, `${label}: must not resolve`)
+    assert.notEqual(resolved, process.cwd(), `${label}: must not fall back to the process cwd`)
+  }
+
+  // The status seam is optional: a registry that exposes no `status()` is
+  // trusted as-is (a host without that field must not be unusable).
+  const statusless = plugin.createWorkspaceRootResolver({
+    sessions: { get: session },
+    workspaceRegistry: { resolveByPath: async () => ({ path: 'F:\\defws\\project\\workspace' }) },
+  })
+  assert.equal(await statusless('conversation-ws'), 'F:\\defws\\project\\workspace')
+})

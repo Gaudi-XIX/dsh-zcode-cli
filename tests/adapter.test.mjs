@@ -90,6 +90,14 @@ if (prompt.includes('@@json@@')) {
 } else if (prompt.includes('@@exit3@@')) {
   process.stderr.write('worker thread died for no documented reason\n')
   process.exitCode = 3
+} else if (prompt.includes('@@transport@@')) {
+  // The shape classifyStderr() maps to ZCODE_UNKNOWN: the CLI never reached
+  // its API, so the failure is a process-level one rather than an exit code.
+  process.stderr.write('Cannot connect to API: AggregateError [ECONNREFUSED]\n')
+  process.exitCode = 1
+} else if (prompt.includes('@@unparsable@@')) {
+  // Neither a frame nor something the whole-segment recovery can read back.
+  process.stdout.write('<<<not a frame>>>\n')
 } else {
   print({ type: 'text', text: 'default answer' })
 }
@@ -592,4 +600,97 @@ test('resolveModel accepts a configured model that the catalog list omits', asyn
   const ids = (await instance.listModels('zcode')).map(model => model.id)
   assert.ok(ids.includes('GLM-5.3-Flash'), `catalog lost the configured model: ${ids.join(', ')}`)
   assert.ok(ids.includes('GLM-5.3'))
+})
+
+/**
+ * `DROPS_SESSION_ON` decides whether a resumed id is forgotten after a failure.
+ * Its membership has to be observable through the durable store the adapter
+ * itself writes, not asserted by copying the set: the tests below seed a record,
+ * drive one failing turn, and read the file back. Congestion and an
+ * output-contract violation say nothing about whether the id is valid, so the
+ * record must survive them; an exit or an unreachable API would be retried into
+ * the same dead id, so the record must go.
+ */
+function seedSession(name, conversationId, sessionId) {
+  const path = join(directory, name)
+  writeFileSync(path, JSON.stringify({
+    version: 1,
+    records: [{ sessionId, conversationId, updatedAt: Date.now() }],
+  }), 'utf8')
+  return path
+}
+
+/** The conversation ids a durable store still holds, in file order. */
+function storedConversations(path) {
+  return JSON.parse(readFileSync(path, 'utf8')).records.map(record => record.conversationId)
+}
+
+test('a queue rejection keeps the resumed id: congestion is not a dead session', async t => {
+  const path = seedSession('busy-sessions.json', 'conversation-busy', 'sess_busy')
+  const instance = adapter(t, { maxConcurrent: 1, maxQueue: 0, sessionMode: 'resume', sessionStorePath: path })
+
+  const before = argvLog().length
+  const abort = new AbortController()
+  const holding = collect(instance.stream(request('@@hang@@ hold the only slot', { signal: abort.signal })))
+  const deadline = Date.now() + 10_000
+  while (argvLog().length === before && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  assert.equal(argvLog().length, before + 1, 'the holding turn must own the only slot')
+
+  const busy = terminalFailure(await collect(instance.stream(request('@@json@@ queued behind it', {
+    sessionId: 'conversation-busy',
+  }))))
+  assert.equal(busy?.code, 'ZCODE_BUSY')
+
+  abort.abort()
+  await holding
+
+  assert.deepEqual(storedConversations(path), ['conversation-busy'], 'a busy queue must not forget the id')
+})
+
+test('an oversized stdout line keeps the resumed id: the id is not the broken part', async t => {
+  const path = seedSession('bytes-sessions.json', 'conversation-bytes', 'sess_bytes')
+  const instance = adapter(t, { maxEventLineLength: 256, sessionMode: 'resume', sessionStorePath: path })
+
+  const failure = terminalFailure(await collect(instance.stream(request('@@longline@@ oversized', {
+    sessionId: 'conversation-bytes',
+  }))))
+  assert.equal(failure?.code, 'ZCODE_OUTPUT_TOO_LARGE')
+  assert.equal(argvLog().at(-1).resume, 'sess_bytes', 'the turn must have resumed before it failed')
+  assert.deepEqual(storedConversations(path), ['conversation-bytes'], 'an output-contract violation must not forget the id')
+})
+
+test('a dead resumed id is forgotten after an exit or an unreachable API', async t => {
+  const exitPath = seedSession('exit-sessions.json', 'conversation-exit', 'sess_exit')
+  const exited = terminalFailure(await collect(adapter(t, {
+    sessionMode: 'resume',
+    sessionStorePath: exitPath,
+  }).stream(request('@@exit3@@ dead', { sessionId: 'conversation-exit' }))))
+  assert.equal(exited?.code, 'ZCODE_EXIT')
+  assert.equal(argvLog().at(-1).resume, 'sess_exit', 'the turn must have tried the recorded id')
+  assert.deepEqual(storedConversations(exitPath), [], 'an exit failure must forget the resumed id')
+
+  const transportPath = seedSession('transport-sessions.json', 'conversation-transport', 'sess_transport')
+  const unreachable = terminalFailure(await collect(adapter(t, {
+    sessionMode: 'resume',
+    sessionStorePath: transportPath,
+  }).stream(request('@@transport@@ unreachable', { sessionId: 'conversation-transport' }))))
+  assert.equal(unreachable?.code, 'ZCODE_UNKNOWN')
+  assert.deepEqual(storedConversations(transportPath), [], 'an unreachable API must forget the resumed id')
+})
+
+test('a parse failure keeps the record: a clean exit leaves the session id usable', async t => {
+  const path = seedSession('parse-sessions.json', 'conversation-parse', 'sess_parse')
+  const instance = adapter(t, { sessionMode: 'resume', sessionStorePath: path })
+
+  const failure = terminalFailure(await collect(instance.stream(request('@@unparsable@@ garbage', {
+    sessionId: 'conversation-parse',
+  }))))
+  assert.equal(failure?.code, 'ZCODE_PARSE')
+  // F-4a adjudication: ZCODE_PARSE is absent from DROPS_SESSION_ON. A clean
+  // exit with no recognizable frame means the gap is in this parser, which has
+  // never seen a successful stdout (F-1), not that the server-side session is
+  // dead. Dropping the id here would destroy a session nothing proves broken.
+  assert.deepEqual(storedConversations(path), ['conversation-parse'])
 })
