@@ -4,9 +4,10 @@
 
 .DESCRIPTION
     dsh-zcode-provider is fail-closed: it refuses to spawn the CLI unless the
-    four ZCODE_* variables and NODE_OPTIONS are present, and it never derives
-    them on its own (a guessed path is how the CLI dies 714 ms in with a
-    message far from the cause).
+    four ZCODE_* variables are set, and it never derives them on its own (a
+    guessed path is how the CLI dies 714 ms in with a message far from the
+    cause). NODE_OPTIONS is not required any more: the provider injects it into
+    the child environment at spawn time.
 
     This script writes them to the *user* environment with
     [Environment]::SetEnvironmentVariable(name, value, 'User').
@@ -17,6 +18,16 @@
     the two DNS flags are appended only when missing, so other flags the user
     set stay in place.
 
+    -Apply never overwrites an existing value that differs from the plan: it
+    prints a WARNING and skips that variable, so a user whose environment was
+    tuned by hand (or by another tool) is not silently rewritten. Pass -Force to
+    overwrite anyway.
+
+    NODE_OPTIONS is optional here: the provider now builds the child environment
+    itself (allowlist + injected NODE_OPTIONS), so the CLI still gets IPv4-first
+    DNS without a user-scope variable. The entry is kept for interactive
+    `zcode.cjs` runs outside DSH.
+
     A missing path is reported as a WARNING and does not abort: this script is
     not allowed to rearrange the live ZCode installation, and a dry run on a
     machine where ZCode lives elsewhere must still be readable.
@@ -26,6 +37,10 @@
 
 .PARAMETER Apply
     Actually write the user-scope variables. Without it, the script is a dry run.
+
+.PARAMETER Force
+    With -Apply, overwrite a variable whose current value differs from the plan.
+    Without it such a variable is reported as a WARNING and left untouched.
 
 .EXAMPLE
     pwsh -File scripts/install-env.ps1
@@ -38,6 +53,8 @@
 [CmdletBinding()]
 param(
     [switch]$Apply,
+
+    [switch]$Force,
 
     [string]$ZcodeHome = 'F:\AgentData\zcode\data\.zcode',
 
@@ -89,13 +106,14 @@ function Test-EntryPath {
     return (Test-Path -LiteralPath $Value -PathType $PathType)
 }
 
-# The five contract entries, in the order ZCODE_ENV_CONTRACT declares them.
+# Four required path entries plus the optional NODE_OPTIONS, in the order
+# ZCODE_ENV_CONTRACT declares them.
 $entries = @(
     [pscustomobject]@{ Name = 'ZCODE_HOME'; Value = $ZcodeHome; PathType = 'Container'; Note = 'bootstrap root' },
     [pscustomobject]@{ Name = 'ZCODE_DATA_BASE_DIR'; Value = $ZcodeDataBaseDir; PathType = 'Container'; Note = 'parent of ZCODE_HOME' },
     [pscustomobject]@{ Name = 'ZCODE_BUILTIN_PROVIDER_CONFIG_FILE'; Value = $BuiltinProviderConfigFile; PathType = 'Leaf'; Note = 'built-in provider config' },
     [pscustomobject]@{ Name = 'ZCODE_PERSONAL_PROVIDER_CONFIG_FILE'; Value = $PersonalProviderConfigFile; PathType = 'Leaf'; Note = 'personal provider config' },
-    [pscustomobject]@{ Name = 'NODE_OPTIONS'; Value = (Merge-NodeOptions -Current (Get-UserValue 'NODE_OPTIONS') -Desired $NodeOptions); PathType = ''; Note = 'IPv4-first DNS for the CLI' }
+    [pscustomobject]@{ Name = 'NODE_OPTIONS'; Value = (Merge-NodeOptions -Current (Get-UserValue 'NODE_OPTIONS') -Desired $NodeOptions); PathType = ''; Note = 'optional (provider injects it at spawn); kept for interactive CLI runs' }
 )
 
 Write-Host $separator
@@ -131,6 +149,19 @@ foreach ($entry in $entries) {
 
 if ($Apply) {
     foreach ($entry in $entries) {
+        $old = Get-UserValue $entry.Name
+        if ($entry.Name -eq 'NODE_OPTIONS' -and -not [string]::IsNullOrWhiteSpace($old)) {
+            $unsafe = @($old -split '\s+' | Where-Object { $_ -match '^(--require|--import|--loader|--experimental-loader|--inspect(-brk)?|--eval|-r|-e)(=|$)' })
+            if ($unsafe.Count -gt 0) {
+                Write-Warning ('NODE_OPTIONS carries a loader/eval switch ({0}); the provider refuses to spawn the CLI with that value. Remove it before relying on the plugin.' -f ($unsafe -join ' '))
+                $warnings = $warnings + 1
+            }
+        }
+        if (-not $Force -and -not [string]::IsNullOrEmpty($old) -and $old -ne $entry.Value) {
+            Write-Warning ('{0} already set to a different value; skipped (pass -Force to overwrite).' -f $entry.Name)
+            $warnings = $warnings + 1
+            continue
+        }
         [Environment]::SetEnvironmentVariable($entry.Name, $entry.Value, $scope)
     }
     Write-Host $separator

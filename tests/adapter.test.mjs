@@ -33,7 +33,18 @@ const resumeIndex = argv.indexOf('--resume')
 const resume = resumeIndex === -1 ? null : (argv[resumeIndex + 1] ?? null)
 
 const log = process.env.ZCODE_FAKE_LOG
-if (log) appendFileSync(log, JSON.stringify({ prompt, resume, argv }) + '\n')
+if (log) {
+  appendFileSync(log, JSON.stringify({
+    prompt,
+    resume,
+    argv,
+    // The child environment is built from a closed allowlist; these two probes
+    // prove both halves of that contract: NODE_OPTIONS is injected, and a host
+    // variable outside the allowlist never reaches the child.
+    nodeOptions: process.env.NODE_OPTIONS ?? null,
+    canary: process.env.SECRET_CANARY ?? null,
+  }) + '\n')
+}
 
 const print = value => process.stdout.write(JSON.stringify(value) + '\n')
 const holdForever = () => setTimeout(() => {}, 60_000)
@@ -67,6 +78,10 @@ if (prompt.includes('@@json@@')) {
   process.exitCode = 1
 } else if (prompt.includes('@@error@@')) {
   print({ type: 'error', message: 'ProviderBusinessError: [1309][套餐已到期][req-frame]' })
+} else if (prompt.includes('@@longline@@')) {
+  // One line far beyond any sane maxEventLineLength.
+  process.stdout.write('x'.repeat(5_000) + '\n')
+  print({ type: 'finish', stopReason: 'end_turn' })
 } else if (prompt.includes('@@hang@@')) {
   // Prints nothing and never exits: only the supervisor's timers end this run.
   holdForever()
@@ -81,19 +96,25 @@ if (prompt.includes('@@json@@')) {
 `
 
 let directory
+let workspace
 let logPath
 let savedEnv
 
 before(() => {
   directory = mkdtempSync(join(tmpdir(), 'zcode-adapter-'))
+  workspace = mkdtempSync(join(tmpdir(), 'zcode-workspace-'))
   logPath = join(directory, 'argv.jsonl')
   writeFileSync(logPath, '', 'utf8')
   writeFileSync(join(directory, 'fake-zcode.cjs'), FAKE_CLI, 'utf8')
 
   // `runZcode` reads the environment contract off `process.env`; the adapter has
-  // no seam for it, so the test supplies a complete (dummy) contract.
+  // no seam for it, so the test supplies a complete (dummy) contract. NODE_OPTIONS
+  // is self-supplied by the provider, so it is cleared instead of faked.
   savedEnv = Object.fromEntries(ZCODE_ENV_CONTRACT.map(entry => [entry.name, process.env[entry.name]]))
-  for (const entry of ZCODE_ENV_CONTRACT) process.env[entry.name] = process.env[entry.name] ?? 'test-value'
+  for (const entry of ZCODE_ENV_CONTRACT) {
+    if (entry.name === 'NODE_OPTIONS') delete process.env.NODE_OPTIONS
+    else process.env[entry.name] = process.env[entry.name] ?? 'test-value'
+  }
   process.env.ZCODE_FAKE_LOG = logPath
 })
 
@@ -103,11 +124,13 @@ after(() => {
     else process.env[name] = value
   }
   delete process.env.ZCODE_FAKE_LOG
+  delete process.env.SECRET_CANARY
   rmSync(directory, { recursive: true, force: true })
+  rmSync(workspace, { recursive: true, force: true })
 })
 
 /** Adapter over the fake CLI, with a fresh session file per test. */
-function adapter(t, overrides = {}) {
+function adapter(t, overrides = {}, deps = {}) {
   const sessions = join(directory, `sessions-${Math.random().toString(36).slice(2)}.json`)
   const instance = new ZcodeAdapter({
     provider: 'zcode',
@@ -117,8 +140,14 @@ function adapter(t, overrides = {}) {
     sessionStorePath: sessions,
     timeoutMs: 20_000,
     idleTimeoutMs: 15_000,
+    // The fake CLI reports through this variable; without it on the passEnv list
+    // the closed child allowlist would (correctly) drop it.
+    passEnv: ['ZCODE_FAKE_LOG'],
     ...overrides,
-  }, { logger: record => { t.diagnostic?.(JSON.stringify(record)) } })
+  }, {
+    logger: record => { t?.diagnostic?.(JSON.stringify(record)) },
+    resolveWorkspaceRoot: deps.resolveWorkspaceRoot ?? (async () => workspace),
+  })
   return instance
 }
 
@@ -127,6 +156,9 @@ function request(text, extra = {}) {
   return {
     provider: 'zcode',
     model: 'GLM-5.3-Flash',
+    // Every real turn is stamped with a session; without one the provider cannot
+    // resolve a workspace and fails closed (covered by its own test below).
+    sessionId: 'conversation-default',
     messages: [{ role: 'user', content: [{ type: 'text', text }] }],
     ...extra,
   }
@@ -218,6 +250,12 @@ test('a successful turn emits block-start, deltas, block-end, usage, finish', as
   assert.ok(entry.argv.includes('--json'))
   assert.ok(entry.argv.includes('--mode') && entry.argv.includes('guarded'))
   assert.equal(entry.resume, null, 'the first turn has nothing to resume')
+  // The working directory is the session workspace resolved through the host
+  // registry, never the DSH installation directory this test runs from.
+  const cwdAt = entry.argv.indexOf('--cwd')
+  assert.ok(cwdAt > 0, 'argv must carry --cwd')
+  assert.equal(entry.argv[cwdAt + 1], workspace)
+  assert.notEqual(entry.argv[cwdAt + 1], process.cwd())
 })
 
 test('a pretty-printed single document still yields one text block', async t => {
@@ -363,6 +401,39 @@ test('AC8: the second turn resumes the remembered session and sends only new inp
   assert.doesNotMatch(turn.prompt, /first question/, 'the resumed session already holds the first turn')
 })
 
+test('back-pressure and an oversized stdout line are busy/output failures, not CLI exits', async t => {
+  const instance = adapter(t, { maxConcurrent: 1, maxQueue: 0 })
+  const policy = instance.providerRetryPolicy('zcode')
+  // Retrying either one would spawn more processes into the same congestion.
+  for (const code of ['ZCODE_BUSY', 'ZCODE_OUTPUT_TOO_LARGE']) {
+    assert.ok(!policy.retryableCodes.includes(code), `${code} must not be retryable`)
+  }
+
+  const before = argvLog().length
+  const abort = new AbortController()
+  const holding = collect(instance.stream(request('@@hang@@ hold the only slot', { signal: abort.signal })))
+  // Wait for the hanging child to exist: the fake CLI logs before it parks.
+  const deadline = Date.now() + 10_000
+  while (argvLog().length === before && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  assert.equal(argvLog().length, before + 1, 'the first turn must be running before the second arrives')
+
+  const busy = terminalFailure(await collect(instance.stream(request('@@json@@ queued behind it', { sessionId: 'queued' }))))
+  assert.equal(busy?.code, 'ZCODE_BUSY')
+  assert.match(busy.message, /queue is full/)
+  // A queue rejection is not a CLI failure, so no second process was started.
+  assert.equal(argvLog().length, before + 1)
+
+  abort.abort()
+  await holding
+
+  const oversized = terminalFailure(
+    await collect(adapter(t, { maxEventLineLength: 256 }).stream(request('@@longline@@'))),
+  )
+  assert.equal(oversized?.code, 'ZCODE_OUTPUT_TOO_LARGE')
+})
+
 test('pre-spawn refusals: dsh-owned tools, an oversized prompt, and a pre-aborted call', async t => {
   const before = argvLog().length
   const spawnCount = () => argvLog().length - before
@@ -416,6 +487,109 @@ test('a missing environment contract fails closed before any spawn', async t => 
     assert.equal(failure?.code, 'ZCODE_ENV_MISSING')
     assert.match(failure.message, /ZCODE_HOME/)
   } finally {
-    for (const [name, value] of Object.entries(saved)) process.env[name] = value
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
   }
+})
+
+test('reject policy refuses tools, sampling options and attachments before spawn', async t => {
+  const before = argvLog().length
+  const instance = adapter(t)
+
+  const media = {
+    messages: [{
+      role: 'user',
+      content: [{ type: 'image', attachment: { attachmentId: 'a1', name: 'shot.png', mimeType: 'image/png', width: 10, height: 10, bytes: 1234 } }],
+    }],
+  }
+  const cases = [
+    [{ tools: [{ name: 'Bash', description: 'run', parameters: { type: 'object' } }] }, 'UNSUPPORTED_TOOLS'],
+    [{ temperature: 0.2 }, 'UNSUPPORTED_OPTION'],
+    [{ maxTokens: 512 }, 'UNSUPPORTED_OPTION'],
+    [{ stop: ['\n\n'] }, 'UNSUPPORTED_OPTION'],
+    [media, 'UNSUPPORTED_CONTENT'],
+  ]
+
+  for (const [extra, code] of cases) {
+    const failure = terminalFailure(await collect(instance.stream(request('@@json@@ refused', extra))))
+    assert.equal(failure?.code, code, `expected ${code} for ${JSON.stringify(Object.keys(extra))}`)
+  }
+  assert.equal(argvLog().length, before, 'a refused request must not start a child process')
+
+  // `stop: []` is a no-op and must stay accepted (it would otherwise be a
+  // breaking change for callers that always pass an empty list).
+  const accepted = await collect(instance.stream(request('@@json@@ empty stop', { stop: [] })))
+  assert.equal(terminalFailure(accepted), undefined)
+  assert.equal(argvLog().length, before + 1)
+})
+
+test('permissive policies project attachments to placeholder text instead of refusing', async t => {
+  const media = {
+    messages: [{
+      role: 'user',
+      content: [{ type: 'image', attachment: { attachmentId: 'a1', name: 'shot.png', mimeType: 'image/png', width: 10, height: 10, bytes: 1234 } }],
+    }],
+  }
+  const chunks = await collect(adapter(t, { toolPolicy: 'dsh-owned' }).stream(request('@@json@@ describe it', media)))
+  assert.equal(terminalFailure(chunks), undefined)
+
+  const entry = argvLog().at(-1)
+  assert.match(entry.prompt, /shot\.png/)
+  assert.match(entry.prompt, /图片内容未发送|图片附件/)
+})
+
+test('a turn without a resolvable workspace fails closed before spawn', async t => {
+  const before = argvLog().length
+  const instance = adapter(t, {}, { resolveWorkspaceRoot: async () => undefined })
+  const failure = terminalFailure(await collect(instance.stream(request('@@json@@ no workspace'))))
+  assert.equal(failure?.code, 'WORKSPACE_UNAVAILABLE')
+  assert.equal(argvLog().length, before, 'no child may start without a workspace')
+})
+
+test('the child environment is the allowlist plus the contract, never the host env', async t => {
+  process.env.SECRET_CANARY = '1'
+  const chunks = await collect(adapter(t).stream(request('@@json@@ env probe')))
+  assert.equal(terminalFailure(chunks), undefined)
+
+  const entry = argvLog().at(-1)
+  assert.equal(entry.canary, null, 'a host-only variable must not reach the child')
+  assert.match(entry.nodeOptions ?? '', /--dns-result-order=ipv4first/)
+  assert.match(entry.nodeOptions ?? '', /--no-network-family-autoselection/)
+})
+
+test('a dead resumed session is deleted, so the next turn starts fresh', async t => {
+  const path = join(directory, 'stale-sessions.json')
+  writeFileSync(path, JSON.stringify({
+    version: 1,
+    records: [{ sessionId: 'sess_dead', conversationId: 'conversation-stale', updatedAt: Date.now() }],
+  }), 'utf8')
+
+  const instance = adapter(t, { sessionMode: 'resume', sessionStorePath: path })
+  const failure = terminalFailure(await collect(instance.stream(request('@@exit3@@ dead session', {
+    sessionId: 'conversation-stale',
+  }))))
+  assert.equal(failure?.code, 'ZCODE_EXIT')
+  assert.equal(argvLog().at(-1).resume, 'sess_dead', 'the first turn did try the stale id')
+
+  const stored = JSON.parse(readFileSync(path, 'utf8'))
+  assert.deepEqual(stored.records, [], 'the dead id must be dropped from the durable map')
+
+  const next = await collect(instance.stream(request('@@json@@ fresh turn', { sessionId: 'conversation-stale' })))
+  assert.equal(terminalFailure(next), undefined)
+  assert.equal(argvLog().at(-1).resume, null, 'the retry must not reuse the dead id')
+})
+
+test('resolveModel accepts a configured model that the catalog list omits', async () => {
+  const instance = adapter({}, {
+    model: 'GLM-5.3-Flash',
+    models: [{ id: 'GLM-5.3', contextWindow: 200_000 }],
+  })
+
+  const resolved = await instance.resolveModel('zcode', 'GLM-5.3-Flash')
+  assert.equal(resolved.id, 'GLM-5.3-Flash')
+  const ids = (await instance.listModels('zcode')).map(model => model.id)
+  assert.ok(ids.includes('GLM-5.3-Flash'), `catalog lost the configured model: ${ids.join(', ')}`)
+  assert.ok(ids.includes('GLM-5.3'))
 })

@@ -11,7 +11,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 
-import { BundleConfig, type Config as ConfigType } from './provider/config.js'
+import { BundleConfig, configBoolean, type Config as ConfigType } from './provider/config.js'
 
 /** Plugin identity; also the settings namespace the Models page keys on. */
 export const name = 'dsh-zcode-provider'
@@ -50,6 +50,51 @@ const ADAPTER_MODULE_SPECIFIER = './provider/zcode.js'
 /** Diagnostic sink handed to the adapter; one JSON line per record. */
 export interface ZcodeAdapterDeps {
   readonly logger: (record: unknown) => void
+  /** Resolve the session workspace root; see {@link createWorkspaceRootResolver}. */
+  readonly resolveWorkspaceRoot?: ((conversationId: string | undefined) => Promise<string | undefined>) | undefined
+}
+
+/** The slice of a DSH session record this entry reads. */
+interface HostSessionLike {
+  readonly header?: { readonly cwd?: unknown } | undefined
+}
+
+/** The slice of a DSH workspace record this entry reads. */
+interface HostWorkspaceLike {
+  readonly path?: unknown
+  status?(): Promise<unknown>
+}
+
+/** The two host services the workspace resolver closes over. */
+interface WorkspaceResolverServices {
+  readonly sessions?: { get?(id: string): HostSessionLike | undefined } | undefined
+  readonly workspaceRegistry?: { resolveByPath?(path: string): Promise<HostWorkspaceLike | undefined> } | undefined
+}
+
+/**
+ * Build the `cwd` resolver the adapter calls before every spawn.
+ *
+ * The host knows the workspace, the adapter does not: `GenerateOptions` carries
+ * no path, so the entry resolves session → `header.cwd` → `workspaceRegistry`
+ * once per turn and hands the root down. Any missing link returns `undefined`,
+ * which the adapter turns into `WORKSPACE_UNAVAILABLE`; it must never fall back
+ * to `process.cwd()` (the DSH install directory, not the user's project).
+ */
+export function createWorkspaceRootResolver(
+  ctx: Context,
+): (conversationId: string | undefined) => Promise<string | undefined> {
+  const services = ctx as unknown as WorkspaceResolverServices
+  return async (conversationId) => {
+    if (conversationId === undefined) return undefined
+    const cwd = services.sessions?.get?.(conversationId)?.header?.cwd
+    if (typeof cwd !== 'string' || cwd.trim().length === 0) return undefined
+    const registry = services.workspaceRegistry
+    if (registry?.resolveByPath === undefined) return undefined
+    const workspace = await registry.resolveByPath(cwd)
+    if (workspace === undefined) return undefined
+    if (typeof workspace.status === 'function' && await workspace.status() !== 'ok') return undefined
+    return typeof workspace.path === 'string' && workspace.path.trim().length > 0 ? workspace.path : cwd
+  }
 }
 
 /**
@@ -96,7 +141,11 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
   // No `registerModelDiscovery`: ZCode 0.17.0 has no quota-free model listing,
   // so the catalog is static and discovery would have to spend a real turn.
 
-  if (config.enabled !== true) {
+  // `enabled` is `.volatile()`, so the host hands `apply` a reference object
+  // (`{ get() }`), not a primitive: `config.enabled !== true` was therefore
+  // always true and the adapter was never registered. `configBoolean` accepts
+  // both the primitive (programmatic config, tests) and the reference.
+  if (!configBoolean(config.enabled)) {
     logger.info('zcode: disabled by config; adapter not registered')
     return
   }
@@ -132,6 +181,7 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
         logger.warn('zcode: diagnostic record was not serializable: %s', describe(error))
       }
     },
+    resolveWorkspaceRoot: createWorkspaceRootResolver(ctx),
   })
 
   ctx.llm.registerAdapter([ZCODE_PROVIDER_ROUTE], adapter)

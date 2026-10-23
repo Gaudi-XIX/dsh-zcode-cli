@@ -32,6 +32,19 @@ export const ZCODE_SESSION_ID_PREFIX = 'sess_'
 /** How much raw stdout a `ZCODE_PARSE` error keeps for diagnostics. */
 export const PARSE_PREVIEW_MAX_CHARS = 512
 
+/**
+ * Default ceiling on frames retained per stream.
+ *
+ * A runaway child can print frames far faster than the turn consumes them; the
+ * parser keeps the first and last slice of the stream (the head carries the
+ * session id and usage header, the tail carries `finish`/`error`) and counts
+ * what it evicted, so memory stays bounded without changing the text total.
+ */
+export const STREAM_MAX_FRAMES = 4_096
+
+/** Frames kept from the head of the stream before the tail window starts. */
+export const FRAMES_HEAD_KEEP = 256
+
 /** Token counters as ZCode reports them, before mapping onto `dsh-llm`'s `TokenUsage`. */
 export interface ZcodeTokenUsage {
   readonly inputTokens: number
@@ -382,8 +395,15 @@ export interface ZcodeParseResult {
 export class ZcodeStreamParser {
   private buffer = ''
   private textChars = 0
-  private readonly seen: ZcodeFrame[] = []
+  private readonly head: ZcodeFrame[] = []
+  private readonly tail: ZcodeFrame[] = []
+  private dropped = 0
+  private readonly maxFrames: number
   private rawHead = ''
+
+  constructor(maxFrames: number = STREAM_MAX_FRAMES) {
+    this.maxFrames = Math.max(FRAMES_HEAD_KEEP + 1, Math.trunc(maxFrames))
+  }
 
   /** Bytes-worth of raw stdout retained for `ZCODE_PARSE` diagnostics. */
   get rawPreview(): string {
@@ -397,9 +417,19 @@ export class ZcodeStreamParser {
     return this.textChars
   }
 
-  /** Frames parsed so far, in arrival order (bounded by usage, not by caller reads). */
+  /** Frames parsed so far, in arrival order (bounded by {@link STREAM_MAX_FRAMES}). */
   get frames(): readonly ZcodeFrame[] {
-    return this.seen
+    return [...this.head, ...this.tail]
+  }
+
+  /** Total frames seen, including the ones evicted from the retention window. */
+  get frameCount(): number {
+    return this.head.length + this.tail.length + this.dropped
+  }
+
+  /** Frames evicted from the retention window (diagnostics only). */
+  get droppedFrameCount(): number {
+    return this.dropped
   }
 
   /** Feed one complete stdout line (no trailing newline). */
@@ -449,7 +479,16 @@ export class ZcodeStreamParser {
 
   private absorb(frames: readonly ZcodeFrame[]): void {
     for (const frame of frames) {
-      this.seen.push(frame)
+      if (this.head.length < FRAMES_HEAD_KEEP) {
+        this.head.push(frame)
+      } else {
+        this.tail.push(frame)
+        const tailCap = this.maxFrames - FRAMES_HEAD_KEEP
+        while (this.tail.length > tailCap) {
+          this.tail.shift()
+          this.dropped += 1
+        }
+      }
       if (frame.kind === 'text') this.textChars += frame.text.length
     }
   }

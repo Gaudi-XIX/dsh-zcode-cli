@@ -193,3 +193,19 @@ test('frame helpers apply the documented fallback order', () => {
   // Both counters are required: a one-sided report is dropped rather than shown as zero.
   assert.equal(frameUsage({ input_tokens: 3 }), undefined)
 })
+
+test('a runaway stream keeps a bounded frame window instead of growing without limit', () => {
+  const parser = new ZcodeStreamParser(300)
+  for (let index = 0; index < 1_000; index += 1) {
+    parser.pushLine(JSON.stringify({ type: 'text_delta', text: `f${index}` }))
+  }
+
+  const frames = parser.frames
+  assert.equal(frames.length, 300, 'retention must be capped')
+  assert.equal(parser.frameCount, 1_000, 'every frame is still counted')
+  assert.equal(parser.droppedFrameCount, 700)
+  // The head keeps the session/usage header; the tail keeps finish/error frames.
+  assert.equal(frameText(frames[0]), 'f0')
+  assert.equal(frameText(frames.at(-1)), 'f999')
+  assert.equal(frames.some(frame => frameText(frame) === 'f500'), false, 'the middle window is dropped')
+})

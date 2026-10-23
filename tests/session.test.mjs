@@ -7,6 +7,7 @@
  */
 
 import assert from 'node:assert/strict'
+import * as nodeFs from 'node:fs'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -172,6 +173,40 @@ test('the file store round-trips records through disk', t => {
   const reader = new FileSessionStore(path, { now: () => 5_000 })
   assert.equal(reader.get('c1')?.sessionId, 'sess_a')
   assert.equal(reader.lastLoadError, undefined)
+})
+
+test('B6: every write goes through a unique temp file and is renamed into place', t => {
+  const path = join(tempDir(t), 'sessions.json')
+  const writes = []
+  const renames = []
+  const fs = {
+    mkdirSync: nodeFs.mkdirSync,
+    rmSync: nodeFs.rmSync,
+    writeFileSync(file, data, encoding) {
+      writes.push(String(file))
+      nodeFs.writeFileSync(file, data, encoding)
+    },
+    renameSync(from, to) {
+      renames.push([String(from), String(to)])
+      nodeFs.renameSync(from, to)
+    },
+  }
+
+  const store = new FileSessionStore(path, { now: () => 5_000, fs })
+  store.set({ sessionId: 'sess_a', conversationId: 'c1', updatedAt: 4_000 })
+  store.set({ sessionId: 'sess_b', conversationId: 'c2', updatedAt: 4_500 })
+
+  assert.equal(writes.length, 2)
+  assert.equal(renames.length, 2)
+  for (const [index, target] of writes.entries()) {
+    // A direct overwrite of the payload file is the torn-write regression this
+    // guards: the only legal target is a temp sibling with an unpredictable name.
+    assert.notEqual(target, path, 'the payload file must never be written directly')
+    assert.match(target, /sessions\.json\.tmp-[^\/]+$/)
+    assert.deepEqual(renames[index], [target, path])
+  }
+  assert.notEqual(writes[0], writes[1], 'temp names must not repeat (uuid suffix)')
+  assert.equal(store.lastSaveError, undefined)
 })
 
 test('loading never throws, whatever the file contains', t => {

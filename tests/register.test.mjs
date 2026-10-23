@@ -28,6 +28,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import * as plugin from '../lib/index.js'
+import { BundleConfig, Config } from '../lib/provider/config.js'
 import { ZcodeAdapter } from '../lib/provider/zcode.js'
 import { ZCODE_ENV_CONTRACT } from '../lib/zcode/process.js'
 
@@ -133,6 +134,41 @@ test('a disabled bundle registers the directory entry but never an adapter', asy
   // the Models page; only the adapter hand-off is skipped.
   assert.equal(calls.providers.length, 1)
   assert.equal(calls.adapters.length, 0)
+})
+
+test('A1: a host-parsed bundle registers its adapter even though enabled is a volatile reference', async () => {
+  // `enabled` carries `.volatile()`, so the host hands `apply` a reference
+  // object, not `true`. Comparing it with `=== true` is always false and kept
+  // the adapter unregistered — this test fails if that comparison comes back.
+  const bundle = BundleConfig({})
+  assert.equal(typeof bundle.enabled, 'object')
+  assert.equal(bundle.enabled === true, false, 'the fixture must reproduce the reference shape')
+
+  const { ctx, calls } = fakeContext()
+  await plugin.apply(ctx, bundle)
+  assert.equal(calls.adapters.length, 1, 'the volatile bundle must register the adapter')
+  assert.ok(calls.adapters[0].adapter instanceof ZcodeAdapter)
+
+  // Disabling through the same reference must still skip registration.
+  const disabled = BundleConfig({ enabled: false })
+  const off = fakeContext()
+  await plugin.apply(off.ctx, disabled)
+  assert.equal(off.calls.adapters.length, 0)
+})
+
+test('A1: every enabled shape the host can hand over is unwrapped, a bare reference included', async () => {
+  const shapes = [
+    [true, 1],
+    [false, 0],
+    [{ isVolatile: true, get: () => true }, 1],
+    [{ isVolatile: true, get: () => false }, 0],
+    [Config({}), 0],
+  ]
+  for (const [enabled, expected] of shapes) {
+    const { ctx, calls } = fakeContext()
+    await plugin.apply(ctx, { ...config(), enabled })
+    assert.equal(calls.adapters.length, expected, `enabled=${JSON.stringify(enabled)}`)
+  }
 })
 
 test('registration has no boot-time side effects: no env read, no process, no file', async () => {

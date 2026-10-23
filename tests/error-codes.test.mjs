@@ -13,12 +13,15 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  DIAGNOSTIC_MAX_CHARS,
   STDERR_TAIL_MAX_CHARS,
   ZCODE_ERROR_CODES,
+  boundDiagnostic,
   classifyStderr,
   boundStderrTail,
   isZcodeError,
   isZcodeErrorCode,
+  sanitizeSecrets,
   ZcodeError,
 } from '../lib/provider/error-codes.js'
 
@@ -44,9 +47,9 @@ date: 'Fri, 23 Oct 2026 17:12:35 GMT', 'x-process-time': '0.298755'`
 const RATE_LIMIT_STDERR = 'ProviderBusinessError: [3007][请求过于频繁，请稍后重试][2026102401123552bbdbe6a99a4f3e]'
 const PERMISSION_STDERR = 'ProviderBusinessError: [3012][unusual activity detected][2026102401123552bbdbe6a99a4f3f]'
 
-test('ZCODE_ERROR_CODES is the frozen list of 12 unique string codes', () => {
-  assert.equal(ZCODE_ERROR_CODES.length, 12)
-  assert.equal(new Set(ZCODE_ERROR_CODES).size, 12)
+test('ZCODE_ERROR_CODES is the frozen list of 17 unique string codes', () => {
+  assert.equal(ZCODE_ERROR_CODES.length, 17)
+  assert.equal(new Set(ZCODE_ERROR_CODES).size, 17)
   for (const code of ZCODE_ERROR_CODES) {
     assert.equal(typeof code, 'string')
     assert.match(code, /^[A-Z][A-Z0-9_]*$/)
@@ -55,8 +58,71 @@ test('ZCODE_ERROR_CODES is the frozen list of 12 unique string codes', () => {
   // The two codes B5 needs are part of the same frozen list.
   assert.ok(ZCODE_ERROR_CODES.includes('PERMISSION_REQUIRED'))
   assert.ok(ZCODE_ERROR_CODES.includes('UNSUPPORTED_TOOLS'))
+  // Round-1 review additions: contract refusals, backpressure/output limits, and
+  // the fail-closed workspace lookup.
+  for (const code of [
+    'UNSUPPORTED_OPTION',
+    'UNSUPPORTED_CONTENT',
+    'ZCODE_BUSY',
+    'ZCODE_OUTPUT_TOO_LARGE',
+    'WORKSPACE_UNAVAILABLE',
+  ]) {
+    assert.ok(ZCODE_ERROR_CODES.includes(code), `missing ${code}`)
+  }
   assert.equal(isZcodeErrorCode('NOT_A_CODE'), false)
   assert.equal(isZcodeErrorCode(undefined), false)
+})
+
+test('diagnostics are sanitized before they leave the process', () => {
+  const openaiStyle = `sk-${'a'.repeat(24)}`
+  const raw = [
+    'Authorization: Bearer abc.def-123',
+    'GET https://api.example/x?token=tk_live_987654&sig=sg_123456 failed',
+    'GET https://api.example/y?a=1&sig=sg_123456 failed',
+    `upstream ${openaiStyle} leaked`,
+  ].join('\n')
+
+  const clean = sanitizeSecrets(raw)
+  assert.doesNotMatch(clean, /abc\.def-123/)
+  assert.doesNotMatch(clean, /tk_live_987654/)
+  assert.doesNotMatch(clean, /sg_123456/)
+  assert.doesNotMatch(clean, new RegExp(openaiStyle))
+  assert.match(clean, /Bearer \*\*\*/)
+  assert.match(clean, /token=\*\*\*/)
+  assert.match(clean, /sig=\*\*\*/)
+  assert.match(clean, /upstream \*\*\* leaked/)
+})
+
+test('diagnostic text is capped at 4 KiB and keeps its tail', () => {
+  const long = `${'a'.repeat(DIAGNOSTIC_MAX_CHARS)}TAIL`
+  const bounded = boundDiagnostic(long)
+  assert.ok(bounded.length <= DIAGNOSTIC_MAX_CHARS, `still ${bounded.length} chars`)
+  assert.ok(bounded.startsWith('…'))
+  assert.ok(bounded.endsWith('TAIL'))
+
+  // The cap also applies to a ZcodeError's provider message and stderr tail.
+  const error = new ZcodeError('ZCODE_EXIT', 'headline', {
+    providerMessage: 'p'.repeat(9_000),
+    stderrTail: 'x'.repeat(9_000),
+  })
+  assert.ok((error.providerMessage ?? '').length <= DIAGNOSTIC_MAX_CHARS)
+  assert.ok((error.stderrTail ?? '').length <= STDERR_TAIL_MAX_CHARS)
+})
+
+test('a ZcodeError scrubs its own message and provider message, not just the helper', () => {
+  // The helper is tested directly above; this covers the wiring, so a future
+  // refactor that drops the call inside `boundDiagnostic` turns this red.
+  const secret = `sk-${'b'.repeat(24)}`
+  const error = new ZcodeError('ZCODE_EXIT', 'upstream said Bearer eyes-only-token', {
+    providerMessage: `Authorization: Bearer eyes-only-token\nGET /v1?token=tk_live_987654\n${secret}`,
+    stderrTail: `Bearer eyes-only-token\n${secret}`,
+  })
+
+  assert.doesNotMatch(error.message, /eyes-only-token/)
+  assert.doesNotMatch(error.providerMessage ?? '', /eyes-only-token|tk_live_987654/)
+  assert.doesNotMatch(error.providerMessage ?? '', new RegExp(secret))
+  assert.doesNotMatch(error.stderrTail ?? '', /eyes-only-token/)
+  assert.doesNotMatch(error.stderrTail ?? '', new RegExp(secret))
 })
 
 test('AC6: 1309 classifies as QUOTA and keeps providerCode + request-id', () => {

@@ -34,7 +34,9 @@ ctx.llm.registerConfigurableProviders([{
 }])
 ```
 
-注册失败（同一 profile 挂载两次）只记 `warn`，路由仍可用。`config.enabled !== true` 时不注册 adapter。
+注册失败（同一 profile 挂载两次）只记 `warn`，路由仍可用。`config.enabled` 为假时不注册 adapter。
+
+`enabled` 在 schema 里带 `.volatile()`（改设置立即生效），因此宿主交给 `apply()` 的常常不是布尔值，而是 `{ isVolatile, get() }` 引用。判定统一走 `configBoolean()`：原生布尔与可调用 `get()` 的引用都接受，其他形状按 `false` 处理；`enabled === true` 这种直接比较对引用恒假，会让 adapter 永不注册（`tests/register.test.mjs` 的 A1 用例守住这条）。
 
 **不注册 `registerModelDiscovery`**：ZCode 0.17.0 没有零额度的模型列举接口，发现动作必然花掉一次真实请求，因此模型目录是静态的（见「模型目录」）。
 
@@ -55,7 +57,7 @@ class ZcodeAdapter extends LlmAdapter {
 | 方法 | 本插件的承诺 |
 |---|---|
 | `providerInfo(provider)` | 返回 `ZCode` 展示名与静态目录 |
-| `listModels(provider)` | 返回 `DEFAULT_MODELS`（`GLM-5.3-Flash`、`GLM-5.3`），按 `visibleModels` 过滤 |
+| `listModels(provider)` | 配置目录（`config.models`，缺失时用 `DEFAULT_MODELS`，并**并入** `config.model`）按 `visibleModels` 过滤 |
 | `resolveModel(provider, model, signal?)` | 只解析静态目录内的 id；目录外 id 显式报错，不改写、不猜测 |
 | `providerRetryPolicy(provider)` | 可重试码 = `RATE_LIMIT`、`TIMEOUT`、`ZCODE_EXIT`、`ZCODE_UNKNOWN` |
 
@@ -64,7 +66,8 @@ class ZcodeAdapter extends LlmAdapter {
 `GenerateOptions` 是 DSH 已组装的无提供方请求：`provider`、`model`、`messages`、`system`、`tools`、`temperature`、`maxTokens`、`stop`、`reasoningEffort`、`signal`、`sessionId`、`purpose`。
 
 - `signal` 必须尊重：取消即终止子进程，映射为 `ABORTED`。
-- 不支持的字段不能静默丢弃，必须抛带稳定 code 的 `ZcodeError`。当前 `toolPolicy: reject`（默认）下非空 `tools`、image block、`temperature`、`maxTokens`、`stop` 都在启动进程前拒绝（`UNSUPPORTED_TOOLS`）。
+- 不支持的字段不能静默丢弃，必须抛带稳定 code 的 `ZcodeError`。默认 `toolPolicy: reject` 下，非空 `tools` 报 `UNSUPPORTED_TOOLS`，`temperature` / `maxTokens` / 非空 `stop` 报 `UNSUPPORTED_OPTION`，image/file block 报 `UNSUPPORTED_CONTENT`——全部在 spawn 之前。
+- `toolPolicy: zcode-owned` 丢弃 DSH 的工具 schema 后继续；`dsh-owned` 拒绝 tools（投影 tool call 需要本版不产出的分片）。两种宽松策略下 image/file 投影为占位文本（`[图片附件 … 图片内容未发送]`），不静默丢失。
 - ZCode 的单次 `-p` 协议没有 reasoning effort 通道，`reasoningEffort` 不做映射，也不假装支持。
 
 ## StreamChunk 顺序
@@ -100,19 +103,23 @@ finish(stop | length | error)
 
 ## 环境契约（fail-closed）
 
-ZCode 0.17.0 需要五项环境变量，缺任一项会在启动 714 ms 内以一条与根因相距很远的消息退出。插件不做推导、不设默认值，**在 spawn 之前**检查（`assertEnvContract()`）：
+ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provider 在 spawn 时自己注入**的 `NODE_OPTIONS`。插件不做推导、不设默认值，在 spawn 之前检查（`assertEnvContract()`）：
 
-| 变量 | 本机取值（2026-10-24 实测） | 缺失后果 |
-|---|---|---|
-| `ZCODE_HOME` | `F:\AgentData\zcode\data\.zcode` | 无法创建 store manager，启动期退出 |
-| `ZCODE_DATA_BASE_DIR` | `F:\AgentData\zcode\data` | 同一 bootstrap 步骤失败 |
-| `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` | `F:\AgentData\zcode\cli\resources\config\provider\zcode-builtin.json` | 714 ms 内报「无法定位 CLI ZCode Built-in Provider Config」 |
-| `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` | `F:\AgentData\zcode\data\.zcode\v2\provider_config.json` | 只给内置/个人之一，ZCode 以「必须同时提供」拒绝两者 |
-| `NODE_OPTIONS` | `--no-network-family-autoselection --dns-result-order=ipv4first` | 双栈主机上 HTTP 客户端报空的 `AggregateError`，只显示 `Cannot connect to API:` |
+| 变量 | 提供方 | 本机取值（2026-10-24 实测） | 缺失后果 |
+|---|---|---|---|
+| `ZCODE_HOME` | 宿主 | `F:\AgentData\zcode\data\.zcode` | 无法创建 store manager，启动期退出 |
+| `ZCODE_DATA_BASE_DIR` | 宿主 | `F:\AgentData\zcode\data` | 同一 bootstrap 步骤失败 |
+| `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` | 宿主 | `F:\AgentData\zcode\cli\resources\config\provider\zcode-builtin.json` | 714 ms 内报「无法定位 CLI ZCode Built-in Provider Config」 |
+| `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` | 宿主 | `F:\AgentData\zcode\data\.zcode\v2\provider_config.json` | 只给内置/个人之一，ZCode 以「必须同时提供」拒绝两者 |
+| `NODE_OPTIONS` | provider | `--no-network-family-autoselection --dns-result-order=ipv4first` | 不会缺失：子进程环境里恒有这两个 flag；用于避免双栈主机上 HTTP 客户端报空的 `AggregateError` |
 
-缺项时抛 `ZcodeError('ZCODE_ENV_MISSING')`，消息逐项列出「变量名（expected 值）」，`stderrTail` 记 `missing: A, B`。取值刻意写死成本机读数，是为了让另一台机器能和它 diff，而不是靠猜 ZCode 堆栈。
+路径项缺任一 → `ZcodeError('ZCODE_ENV_MISSING')`，消息逐项列出「变量名（expected 值）」，`stderrTail` 记 `missing: A, B`。取值刻意写死成本机读数，是为了让另一台机器能和它 diff，而不是靠猜 ZCode 堆栈。
 
-写入环境变量用 `scripts/install-env.ps1`（默认 dry-run，`-Apply` 才写用户级变量；`NODE_OPTIONS` 已存在时追加去重，不覆盖用户其他选项）。写完后**必须重启 DSH**：插件在 spawn 时读取环境，进程内的 `process.env` 不会自己刷新。
+`NODE_OPTIONS` 走**值级白名单**（`resolveNodeOptions()`）：宿主若设置了它，token 只允许上面两个 flag，其他任何 token（`--require`、`-r`、`--import`、`--loader`、`--inspect`、`-e` 等）都在 spawn 前报 `ZCODE_ENV_MISSING`——`NODE_OPTIONS` 会进入子进程，等于一条代码执行通道，不能透传。
+
+**子进程环境是闭集**（`buildChildEnv()`）：只取 `PATH`、`SystemRoot`、`SystemDrive`、`windir`、`TEMP`、`TMP`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`COMSPEC`、`PATHEXT`，加上上面五项契约值与 `config.passEnv` 显式列出的变量名。宿主其他变量（含各种 API key / token）不会进入子进程；测试用 `SECRET_CANARY` 断言这一点。
+
+写入路径变量用 `scripts/install-env.ps1`（默认 dry-run，`-Apply` 才写用户级变量）。`-Apply` 遇到「已存在且与目标值不同」的变量会 **WARNING 并跳过**，只有再加 `-Force` 才覆盖——避免脚本一跑就把用户自己的 `NODE_OPTIONS` 冲掉。`NODE_OPTIONS` 不必再写用户级变量：provider 在 spawn 时注入。写完仍需**重启 DSH**（宿主环境在启动时读一次）。
 
 ## argv 契约
 
@@ -123,12 +130,13 @@ ZCode 0.17.0 需要五项环境变量，缺任一项会在启动 714 ms 内以�
 ```
 
 - `--mode` 的取值只有 `guarded`，由常量固定；任何其他取值（包括配置里写别的）在函数入口抛 `TypeError`，不是警告、不是回退。
+- `--cwd` 取自**本会话的 workspace 根**：`ctx.sessions.get(sessionId).header.cwd` → `workspaceRegistry.resolveByPath()` → `status() === 'ok'` → `workspace.path`。解析不到（无 session、无 resolver、目录已删、status 非 ok）时在 spawn 前报 `WORKSPACE_UNAVAILABLE`，**不退回** `process.cwd()`：让子进程在 DSH 安装目录里跑等于让它到处写文件。
 - `--resume` 只在 `resume === true` **且** `sessionId` 非空、且不以 `-` 开头时出现，避免把用户内容拼成 flag。
 - `--verbose` 恒在最后，不影响前面几项的位置。
 
 ## 错误码表
 
-`ZCODE_ERROR_CODES` 共 12 个，冻结于 B2，不新增第 13 个；错误只从 stderr 文本解析（`classifyStderr()`），provider 数字码保留在 `ZcodeError.providerCode`。
+`ZCODE_ERROR_CODES` 共 **17** 个（原 12 个 + 本轮 5 个：`UNSUPPORTED_OPTION`、`UNSUPPORTED_CONTENT`、`ZCODE_BUSY`、`ZCODE_OUTPUT_TOO_LARGE`、`WORKSPACE_UNAVAILABLE`）；错误只从 stderr 文本解析（`classifyStderr()`），provider 数字码保留在 `ZcodeError.providerCode`。
 
 | code | 含义 | 可重试 |
 |---|---|---|
@@ -136,16 +144,23 @@ ZCode 0.17.0 需要五项环境变量，缺任一项会在启动 714 ms 内以�
 | `RATE_LIMIT` | 速率限制（含 429） | 是 |
 | `PERMISSION_REQUIRED` | 账号无权执行该请求 | 否 |
 | `AUTH` | 身份被拒 | 否 —— 需要新凭据 |
-| `ZCODE_ENV_MISSING` | 环境契约不完整 | 否 —— 需先修宿主 |
+| `ZCODE_ENV_MISSING` | 环境契约不完整 / `NODE_OPTIONS` 含禁用 flag | 否 —— 需先修宿主 |
 | `MODEL_NOT_FOUND` | ZCode 不认识请求的模型 | 否 |
 | `ZCODE_PARSE` | stdout/帧解析失败 | 否 |
 | `ZCODE_EXIT` | 非零退出 | 是 |
 | `ZCODE_UNKNOWN` | 未识别的失败 | 是 |
 | `TIMEOUT` | 墙钟或空闲超时 | 是 |
 | `ABORTED` | 调用方取消 | 否 |
-| `UNSUPPORTED_TOOLS` | 请求携带了本模式不支持的能力 | 否 |
+| `UNSUPPORTED_TOOLS` | 请求携带了本模式不接受的 tools | 否 |
+| `UNSUPPORTED_OPTION` | 请求携带 `temperature` / `maxTokens` / 非空 `stop` | 否 |
+| `UNSUPPORTED_CONTENT` | `reject` 模式下携带 image/file block | 否 |
+| `ZCODE_BUSY` | 并发队列已满（`maxQueue`） | 否 —— 拥塞不是进程故障，不重试也不丢 session |
+| `ZCODE_OUTPUT_TOO_LARGE` | 单行或总量超过 `maxEventLineLength` / `maxOutputBytes` | 否 —— 重试只会再超限 |
+| `WORKSPACE_UNAVAILABLE` | 解析不到会话 workspace 根 | 否 —— 需宿主侧修数据 |
 
-`stderrTail` 一律截断到 2048 字符（`STDERR_TAIL_MAX_CHARS`），报告里只出现有界片段。
+`ZCODE_BUSY` 与 `ZCODE_OUTPUT_TOO_LARGE` 刻意**不在**重试白名单、也**不在** `DROPS_SESSION_ON`：前者是排队拥塞，重试只会放大；后者说明输出契约被违反，换一次 spawn 也还是超限。两者也不丢 session id——session 没坏，坏的是这一次调用的形态。
+
+`stderrTail` 一律截断到 2048 字符（`STDERR_TAIL_MAX_CHARS`），报告里只出现有界片段。诊断文本（`message` / `providerMessage`）另经 `sanitizeSecrets()` 脱敏（`Bearer …`、`?token=…`/`&sig=…` 查询参数、`sk-…` 形态的 key）并截断到 4 KiB（`DIAGNOSTIC_MAX_CHARS`）。
 
 `providerCode` 的类型是**数字**（`ZcodeError.providerCode?: number`）：`[1309]` 解析为 `1309`，不是字符串 `'1309'`；没有数字码时字段缺席（`undefined`），调用方按 `=== 1309` 比较。
 
@@ -183,7 +198,7 @@ ZCode 0.17.0 需要五项环境变量，缺任一项会在启动 714 ms 内以�
 |---|---|
 | `node-version` | 主版本 < 22 → fail（ZCode 0.17.0 加载 `node:sqlite`） |
 | `node-executable` | `config.nodePath` 不存在或不是文件 → fail |
-| `env-contract` | 五项缺任一 → fail；取值与记录不一致 → warn |
+| `env-contract` | 四项宿主路径变量缺任一 → fail；`NODE_OPTIONS` 由 provider 注入，不入判据（宿主设置时只校验值级白名单） |
 | `cli-entry` | `config.zcodeCjsPath` 不存在或不是文件 → fail |
 | `builtin-config` | 不存在 / 不可读 / 非 JSON 对象 → fail |
 | `personal-config` | 同上（ZCode 要求两者同时提供） |
@@ -208,6 +223,14 @@ ZCode 0.17.0 需要五项环境变量，缺任一项会在启动 714 ms 内以�
 2. 环境变量可保留：它们只是 ZCode CLI 需要的宿主配置，删掉会让 ZCode 本体也起不来；确需删除时按 `install-env.ps1` 输出的键名逐个 `[Environment]::SetEnvironmentVariable(name, $null, 'User')`。
 3. 重启 DSH。
 
+## 门禁
+
+`node scripts/run-tests.mjs` 是唯一入口，顺序固定：AC11（`src/`、`tests/`、`scripts/`、`docs/` 与根级文本文件全部 LF、无 BOM）→ `tsc --noEmit` → `tsc`（build）→ 包入口点（`main` / `types` / `exports` / `dsh.bundle.patch` 指向的文件存在，且 `dependencies` 为空）→ 测试面计数 → `node --test`。
+
+测试面：`tests/` 下递归共 **9** 个 `*.test.mjs`，必须与脚本里的 `EXPECTED_TEST_FILES` 集合相等，也必须等于本行声明的数字（`declaredTestCount()` 解析本行）。少一个、多一个、改名一个都会让门禁在跑测试前就停——不允许「测试变少、门禁仍绿」。
+
+受控文件：`git ls-files` 共 **27** 个（9 个测试 + 8 个 `src/**` 源文件 + 脚本、文档、配置、README）。门禁会拿 `git ls-files` 的实点数与这一行比对，改文件数必须同步改这行。
+
 ## 已知限制
 
 - **L1 未验证成功路径**：账号 1309，`-p` 成功时的 stdout 形状（NDJSON 还是整段 JSON）没有读数，因此 `parseStdout()` 的口径是结构推定，不是实测。
@@ -216,4 +239,7 @@ ZCode 0.17.0 需要五项环境变量，缺任一项会在启动 714 ms 内以�
 - **L4 未验证 150% 计费**：产品目标要求的倍率没有服务端账单读数，**禁止用本地文件推断计费**。
 - **L5 不判权益**：doctor 与运行时都不判断套餐状态，1309 只作为历史观测记录。
 - **L6 错误码语义待校准**：`3007` / `3012` 的真实语义（风控还是权限）未核对，映射可能需微调。
-- **L7 `--cwd` 只能是宿主目录**：`GenerateOptions` 不带 workspace 字段，adapter 拿不到会话的工作目录，子进程因此继承 `process.cwd()`（宿主目录）。需要「按工作区切 cwd」得先在宿主侧加一条传递路径，本版没有。
+- **L7 workspace 解析可能拿不到**：`--cwd` 现在取自 `sessions.get(id).header.cwd` → `workspaceRegistry.resolveByPath()` → `status() === 'ok'`。宿主没有该 session、registry 返回 undefined、目录已删或 status 非 `ok` 时，本 provider **fail-closed**（`WORKSPACE_UNAVAILABLE`，不退回 `process.cwd()`）。因此「会话目录不可用」的表现是明确报错，而不是在 DSH 安装目录里跑。
+- **L8 工具面由 CLI 自己管**：`toolPolicy: reject` 只拒绝**下发 DSH 的工具 schema**；它关不掉 ZCode CLI 自身的工具能力。`--mode guarded` 下 CLI 内部工具（读写文件、执行命令）的行为**未验证**（账号 1309，无法实测）。因此本文档**不宣称「工具已禁用」**，只说「DSH 侧的工具调用不会被下发、也不会被接受」。
+- **L9 prompt 在进程命令行可见**：ZCode 的 `-p` 形态把整轮 prompt 放进 argv，同机其他进程读得到命令行。这是 CLI 协议固有，本 provider 无法规避；不要把凭据写进 prompt。
+- **L10 原子写只在单进程内有效**：`sessions.json` 用 `tmp + rename` 并带 `pid + uuid` 临时名，能防半写与名字碰撞；没有跨进程锁，同一 `sessionStorePath` 被两个 DSH 实例同时写不是一个受支持的情形。

@@ -70,6 +70,23 @@ export const ZCODE_ENV_CONTRACT: readonly ZcodeEnvContractEntry[] = [
 /** Node floor: ZCode 0.17.0 loads `node:sqlite`, which exists from Node 22. */
 export const MIN_NODE_MAJOR = 22
 
+/**
+ * Contract entries the provider can supply itself.
+ *
+ * `NODE_OPTIONS` is the only one: the two DNS flags are a transport fix, not an
+ * installation fact, so the provider merges them into the child environment at
+ * spawn time instead of demanding that the user write a global variable.
+ */
+/**
+ * `NODE_OPTIONS` is the one contract entry the provider supplies itself, so a
+ * host without it is not "missing": the value is assembled at spawn time from
+ * {@link NODE_OPTIONS_REQUIRED} and any host value must pass the same allowlist.
+ */
+const SELF_SUPPLIED_ENV = new Set(['NODE_OPTIONS'])
+
+/** Flags the provider always contributes to `NODE_OPTIONS`. */
+export const NODE_OPTIONS_REQUIRED = ['--no-network-family-autoselection', '--dns-result-order=ipv4first'] as const
+
 /** A process environment as seen by the contract check. */
 export type ZcodeEnv = Readonly<Record<string, string | undefined>>
 
@@ -77,6 +94,7 @@ export type ZcodeEnv = Readonly<Record<string, string | undefined>>
 export function missingEnvKeys(env: ZcodeEnv): string[] {
   const missing: string[] = []
   for (const entry of ZCODE_ENV_CONTRACT) {
+    if (SELF_SUPPLIED_ENV.has(entry.name)) continue
     const value = env[entry.name]
     if (value === undefined || value.trim().length === 0) missing.push(entry.name)
   }
@@ -109,11 +127,85 @@ export function assertEnvContract(env: ZcodeEnv): Record<string, string> {
   }
   const resolved: Record<string, string> = {}
   for (const entry of ZCODE_ENV_CONTRACT) {
+    if (SELF_SUPPLIED_ENV.has(entry.name)) continue
     const value = env[entry.name]
     if (value !== undefined) resolved[entry.name] = value
   }
+  resolved['NODE_OPTIONS'] = resolveNodeOptions(env['NODE_OPTIONS'])
   return resolved
 }
+
+/**
+ * Validate and complete a `NODE_OPTIONS` value.
+ *
+ * Value-level allowlist: the only tokens that may reach the child are the two
+ * documented DNS flags. Anything else — loader/eval switches first of all — is
+ * refused before a process exists, because `NODE_OPTIONS` is inherited by the
+ * child Node process and a planted `--require` would run arbitrary code there.
+ *
+ * @throws ZcodeError `ZCODE_ENV_MISSING` when the value carries any other token.
+ */
+export function resolveNodeOptions(value: string | undefined): string {
+  const tokens = (value ?? '').trim().split(/\s+/).filter(token => token.length > 0)
+  const allowed = new Set<string>(NODE_OPTIONS_REQUIRED)
+  for (const token of tokens) {
+    if (!allowed.has(token)) {
+      throw new ZcodeError(
+        'ZCODE_ENV_MISSING',
+        `NODE_OPTIONS carries an unsupported flag "${token}"; `
+          + `this provider only accepts ${NODE_OPTIONS_REQUIRED.join(' ')}`,
+        { stderrTail: 'unsupported NODE_OPTIONS flag' },
+      )
+    }
+  }
+  const merged = [...tokens]
+  for (const required of NODE_OPTIONS_REQUIRED) {
+    if (!merged.includes(required)) merged.push(required)
+  }
+  return merged.join(' ')
+}
+
+/**
+ * Build the child environment from a closed allowlist.
+ *
+ * The child sees the operating-system variables Node itself needs plus the five
+ * contract entries (and `passEnv` names the operator opted into) — never the
+ * whole host environment. `request.env` is the *source*, so a test that passes
+ * a fake environment gets exactly that: nothing from `process.env` leaks in.
+ */
+export function buildChildEnv(options: {
+  readonly source: ZcodeEnv
+  readonly contract: Readonly<Record<string, string>>
+  readonly passEnv?: readonly string[] | undefined
+}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  for (const key of ZCODE_ENV_ALLOWLIST) {
+    const value = options.source[key]
+    if (value !== undefined && value.length > 0) env[key] = value
+  }
+  for (const key of options.passEnv ?? []) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+    const value = options.source[key]
+    if (value !== undefined) env[key] = value
+  }
+  for (const [key, value] of Object.entries(options.contract)) env[key] = value
+  return env
+}
+
+/** The operating-system variables the child inherits; everything else is closed. */
+export const ZCODE_ENV_ALLOWLIST = [
+  'PATH',
+  'SystemRoot',
+  'SystemDrive',
+  'windir',
+  'TEMP',
+  'TMP',
+  'USERPROFILE',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'COMSPEC',
+  'PATHEXT',
+] as const
 
 /** Options of {@link buildZcodeArgs}. */
 export interface BuildZcodeArgsOptions {
@@ -218,6 +310,8 @@ export interface ZcodeSpawnRequest {
   readonly onStdoutLine?: ((line: string) => void) | undefined
   /** Called once per stderr chunk. */
   readonly onStderrChunk?: ((chunk: string) => void) | undefined
+  /** Called with process-layer diagnostics (e.g. a failed taskkill). */
+  readonly onDiagnostic?: ((record: unknown) => void) | undefined
 }
 
 /** Result of {@link spawnZcode}. */
@@ -247,13 +341,31 @@ const KILL_GRACE_MS = 3_000
  * On Windows the process tree is killed with `taskkill /t /f`, because ZCode
  * spawns its own workers and a bare `child.kill()` would leave them holding the
  * session directory. Detached process groups cover POSIX.
+ *
+ * `spawnFn` exists for tests: a taskkill that fails asynchronously must surface
+ * as a diagnostic, not as an uncaught `error` event in the host.
  */
-function terminateProcessTree(child: ChildProcess): void {
+export function terminateProcessTree(
+  child: Pick<ChildProcess, 'pid' | 'kill'>,
+  onDiagnostic?: ((record: unknown) => void) | undefined,
+  spawnFn: typeof spawn = spawn,
+): void {
   const pid = child.pid
   if (pid === undefined) return
   if (process.platform === 'win32') {
     try {
-      spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { shell: false, windowsHide: true, stdio: 'ignore' })
+      const killer = spawnFn('taskkill', ['/pid', String(pid), '/t', '/f'], { shell: false, windowsHide: true, stdio: 'ignore' })
+      // A spawn that fails asynchronously (taskkill missing, no handle) emits
+      // 'error' on the ChildProcess; without a listener it would become an
+      // uncaught exception in the host process.
+      killer.on('error', (error) => {
+        onDiagnostic?.({ kind: 'zcode.process.taskkill.failed', pid, message: errorText(error) })
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          // Already gone.
+        }
+      })
     } catch {
       child.kill('SIGKILL')
     }
@@ -368,7 +480,7 @@ export function spawnZcode(request: ZcodeSpawnRequest): Promise<ZcodeSpawnResult
       if (termination !== undefined) return
       termination = reason
       if (!stdinClosed) endStdin()
-      terminateProcessTree(child)
+      terminateProcessTree(child, request.onDiagnostic)
       // taskkill /t /f normally settles the child at once; this is the backstop
       // for a tree that ignores it and would otherwise hang the request forever.
       graceTimer = setTimeout(() => {
@@ -497,6 +609,10 @@ export interface ZcodeRunRequest {
   readonly verbose?: boolean | undefined
   /** Override the inherited environment (tests pass a fake contract). */
   readonly env?: ZcodeEnv | undefined
+  /** Extra host variable names the child may inherit, on top of the closed allowlist. */
+  readonly passEnv?: readonly string[] | undefined
+  /** Called with process-layer diagnostics (e.g. a failed taskkill). */
+  readonly onDiagnostic?: ((record: unknown) => void) | undefined
   /** Cancel signal. */
   readonly signal?: AbortSignal | undefined
   /** Called once per stdout line. */
@@ -535,8 +651,11 @@ export interface ZcodeRunResult extends ZcodeSpawnResult {
  */
 export async function runZcode(request: ZcodeRunRequest): Promise<ZcodeRunResult> {
   const { config } = request
-  const env = request.env ?? process.env
-  const contract = assertEnvContract(env)
+  // `request.env` is the environment *source*: a fake env handed in by a test
+  // must be the only thing the child sees (no process.env merge).
+  const sourceEnv = request.env ?? process.env
+  const contract = assertEnvContract(sourceEnv)
+  const childEnv = buildChildEnv({ source: sourceEnv, contract, passEnv: request.passEnv })
 
   const args = buildZcodeArgs({
     prompt: request.prompt,
@@ -553,7 +672,7 @@ export async function runZcode(request: ZcodeRunRequest): Promise<ZcodeRunResult
       zcodeCjsPath: config.zcodeCjsPath,
       args,
       cwd: request.cwd,
-      env: { ...process.env, ...contract },
+      env: childEnv,
       timeoutMs: config.timeoutMs,
       idleTimeoutMs: config.idleTimeoutMs,
       maxOutputBytes: config.maxOutputBytes,
@@ -561,6 +680,7 @@ export async function runZcode(request: ZcodeRunRequest): Promise<ZcodeRunResult
       stdinMode: config.stdinMode,
       signal: request.signal,
       onStdoutLine: request.onStdoutLine,
+      onDiagnostic: request.onDiagnostic,
     })
     assertCleanExit(result)
     return { ...result, argv: [config.nodePath, config.zcodeCjsPath, ...args] }
@@ -582,7 +702,7 @@ export function assertCleanExit(result: ZcodeSpawnResult): void {
       throw new ZcodeError('TIMEOUT', `ZCode produced no output for longer than its inactivity budget (${result.durationMs} ms)`, { stderrTail: result.stderrTail })
     case 'output-limit':
       throw new ZcodeError(
-        'ZCODE_EXIT',
+        'ZCODE_OUTPUT_TOO_LARGE',
         result.lineOverflow
           ? 'ZCode emitted a stdout line beyond maxEventLineLength'
           : 'ZCode output exceeded maxOutputBytes',
@@ -617,7 +737,7 @@ function acquireSlot(config: ZcodeProcessConfig): Promise<() => void> {
     return Promise.resolve(release)
   }
   if (waitingProcesses.length >= Math.max(0, config.maxQueue)) {
-    return Promise.reject(new ZcodeError('ZCODE_EXIT', `ZCode queue is full (${config.maxQueue} waiting)`))
+    return Promise.reject(new ZcodeError('ZCODE_BUSY', `ZCode queue is full (${config.maxQueue} waiting)`))
   }
   return new Promise<() => void>((resolve, reject) => {
     let settled = false

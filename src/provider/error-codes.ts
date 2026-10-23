@@ -38,12 +38,50 @@ export const ZCODE_ERROR_CODES = [
   'ABORTED',
   /** The configured tool policy cannot be honoured on this route. */
   'UNSUPPORTED_TOOLS',
+  /** A request option this route cannot carry (temperature/maxTokens/stop) was set. */
+  'UNSUPPORTED_OPTION',
+  /** A request content block this route cannot carry (image/file under `reject`). */
+  'UNSUPPORTED_CONTENT',
+  /** The concurrency gate is full; nothing was spawned and no session was touched. */
+  'ZCODE_BUSY',
+  /** The child exceeded maxOutputBytes or maxEventLineLength; it was killed. */
+  'ZCODE_OUTPUT_TOO_LARGE',
+  /** The host could not resolve a workspace root for the session; nothing was spawned. */
+  'WORKSPACE_UNAVAILABLE',
 ] as const
 
 export type ZcodeErrorCode = typeof ZCODE_ERROR_CODES[number]
 
 /** How much stderr text is retained on an error for diagnostics. */
 export const STDERR_TAIL_MAX_CHARS = 2_048
+
+/** Ceiling on `message` and `providerMessage`; third-party text never grows past this. */
+export const DIAGNOSTIC_MAX_CHARS = 4_096
+
+/**
+ * Remove the credential-shaped substrings third-party text tends to carry.
+ *
+ * Light by design: three well-known shapes only (`Bearer …`, `token|key|sig=…`
+ * query parameters, `sk-…` keys). Anything broader would start rewriting model
+ * prose, which this provider has no business editing.
+ */
+export function sanitizeSecrets(text: string): string {
+  return text
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer ***')
+    .replace(/([?&])(token|access_token|api_key|apikey|key|sig|signature)=[^&\s"'<>]+/gi, '$1$2=***')
+    .replace(/\bsk-[A-Za-z0-9]{16,}\b/g, '***')
+}
+
+/** Bound and sanitize one diagnostic string. */
+export function boundDiagnostic(text: string): string
+export function boundDiagnostic(text: string | undefined): string | undefined
+export function boundDiagnostic(text: string | undefined): string | undefined {
+  if (text === undefined) return undefined
+  const cleaned = sanitizeSecrets(text.trim())
+  if (cleaned.length === 0) return undefined
+  if (cleaned.length <= DIAGNOSTIC_MAX_CHARS) return cleaned
+  return `…${cleaned.slice(cleaned.length - (DIAGNOSTIC_MAX_CHARS - 1))}`
+}
 
 /** Type guard for the frozen code list. */
 export function isZcodeErrorCode(value: unknown): value is ZcodeErrorCode {
@@ -85,8 +123,10 @@ export class ZcodeError extends Error {
     super(message, options.cause === undefined ? undefined : { cause: options.cause })
     this.name = 'ZcodeError'
     this.code = code
+    const boundedMessage = boundDiagnostic(message)
+    if (boundedMessage !== undefined && boundedMessage !== message) this.message = boundedMessage
     this.providerCode = options.providerCode
-    this.providerMessage = options.providerMessage
+    this.providerMessage = boundDiagnostic(options.providerMessage)
     this.responseStatus = options.responseStatus
     this.requestId = options.requestId
     this.stderrTail = boundStderrTail(options.stderrTail)
@@ -107,7 +147,7 @@ export function isZcodeError(value: unknown): value is ZcodeError {
  */
 export function boundStderrTail(stderr: string | undefined): string | undefined {
   if (stderr === undefined) return undefined
-  const trimmed = stderr.trim()
+  const trimmed = sanitizeSecrets(stderr.trim())
   if (trimmed.length === 0) return undefined
   if (trimmed.length <= STDERR_TAIL_MAX_CHARS) return trimmed
   return `…${trimmed.slice(trimmed.length - (STDERR_TAIL_MAX_CHARS - 1))}`

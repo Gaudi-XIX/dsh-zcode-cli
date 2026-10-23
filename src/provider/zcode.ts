@@ -37,22 +37,27 @@
  * terminal frame, and a synthesized frame loses the provider facts (code,
  * providerCode, request-id) this file already holds in hand.
  *
- * ## Tool policy (fail-closed)
+ * ## Tool policy and unsupported request fields (fail-closed)
  *
- * `toolPolicy` decides what happens to the DSH tool schemas in a request; it
- * never decides whether a tool *request* is honored, because a headless
- * `--mode guarded` process has no approval channel and cannot honor one:
+ * `toolPolicy` decides what happens to the DSH-owned part of a request; it never
+ * decides whether a tool *request* is honored, because a headless `--mode
+ * guarded` process has no approval channel and cannot honor one:
  *
- * | policy | request carries `tools` | a tool-shaped stdout frame arrives |
- * | --- | --- | --- |
- * | `reject` | schemas dropped, turn proceeds | child killed; `PERMISSION_REQUIRED` or `UNSUPPORTED_TOOLS` |
- * | `zcode-owned` | schemas dropped, turn proceeds | child killed; `PERMISSION_REQUIRED` or `UNSUPPORTED_TOOLS` |
- * | `dsh-owned` | request refused before spawn: `UNSUPPORTED_TOOLS` | unreachable |
+ * | policy | request carries `tools` | `temperature`/`maxTokens`/`stop` | image/file block | a tool-shaped stdout frame |
+ * | --- | --- | --- | --- | --- |
+ * | `reject` | refused before spawn: `UNSUPPORTED_TOOLS` | refused before spawn: `UNSUPPORTED_OPTION` | refused before spawn: `UNSUPPORTED_CONTENT` | child killed; `PERMISSION_REQUIRED` or `UNSUPPORTED_TOOLS` |
+ * | `zcode-owned` | schemas dropped, turn proceeds | refused before spawn: `UNSUPPORTED_OPTION` | projected to placeholder text | child killed; `PERMISSION_REQUIRED` or `UNSUPPORTED_TOOLS` |
+ * | `dsh-owned` | refused before spawn: `UNSUPPORTED_TOOLS` | refused before spawn: `UNSUPPORTED_OPTION` | projected to placeholder text | unreachable |
  *
  * `dsh-owned` is refused up front because projecting a tool call back to DSH
  * would require the `tool-call-delta` + `block-end(tool-call)` frames this
  * version deliberately does not emit; advertising it as working would be a
  * silent downgrade of the tool surface.
+ *
+ * `temperature`, `maxTokens` and `stop` have no channel in ZCode 0.17.0, so
+ * accepting them and dropping them silently would let a caller believe a
+ * sampling setting took effect. They are refused under every policy, before the
+ * process starts.
  *
  * ## Session binding
  *
@@ -78,15 +83,20 @@
  *   `tasks.md` recovery condition 2). The stale record is dropped instead, so
  *   the next turn starts clean.
  * - **D-c** Image and file blocks are projected to placeholder text rather than
- *   rejected: a text-only route is exactly what `imageInput: 'off'` means, and
- *   DSH itself renders offloaded images the same way.
+ *   rejected, except under `toolPolicy: 'reject'`: that policy promises to refuse
+ *   anything this route cannot carry, so a reject-mode request carrying an image
+ *   or file block fails with `UNSUPPORTED_CONTENT` before the process starts. A
+ *   text-only route is exactly what `imageInput: 'off'` means for the permissive
+ *   policies, and DSH itself renders offloaded images the same way.
  *
  * ## Unresolved
  *
- * - The CLI inherits `process.cwd()` as its working directory: `GenerateOptions`
- *   carries no workspace path, so the session's own directory is not reachable
- *   from an adapter. A profile that needs per-workspace `--cwd` needs a seam
- *   this batch does not have.
+ * - `toolPolicy` cannot switch off the ZCode CLI's own tool surface: `--mode
+ *   guarded` is delegated to the CLI, whose headless behavior is unverified (the
+ *   subscription quota expired before a live run). This adapter refuses the DSH
+ *   tool schema; it does not and cannot prove that the CLI ran no tool of its own.
+ * - The turn is one `-p` argv entry, so the full prompt is visible in the child's
+ *   command line to any local process able to read it (inherent to `-p`).
  */
 
 import {
@@ -116,11 +126,13 @@ import {
   DEFAULT_NODE_PATH,
   DEFAULT_ZCODE_CJS_PATH,
   ZCODE_RETRYABLE_CODES,
+  configuredModels,
+  filterVisibleModels,
   type Config,
   type ModelConfig,
   type ZcodeToolPolicy,
 } from './config.js'
-import { ZcodeError, isZcodeError } from './error-codes.js'
+import { ZcodeError, boundDiagnostic, isZcodeError } from './error-codes.js'
 import { QUOTA_PROVIDER_CODE, recordQuotaObservation } from '../diagnostics.js'
 import { FileSessionStore, sessionStorePath } from '../session/file-store.js'
 import { SessionRegistry } from '../session/store.js'
@@ -209,6 +221,16 @@ type AbortCause = 'caller' | 'tool' | 'in-band-error'
 export interface ZcodeAdapterDeps {
   /** One structured record per event; the entry serializes it to a log line. */
   readonly logger: (record: unknown) => void
+  /**
+   * Resolve the working directory of the session's workspace.
+   *
+   * The host owns this knowledge: `GenerateOptions` carries no workspace, so the
+   * bundle entry closes over `sessions` and `workspaceRegistry` and hands the
+   * resolved root in. Returning `undefined` is a hard failure, never a fallback
+   * to `process.cwd()` (which is the DSH install directory, not the user's
+   * project).
+   */
+  readonly resolveWorkspaceRoot?: ((conversationId: string | undefined) => Promise<string | undefined>) | undefined
 }
 
 /**
@@ -230,14 +252,19 @@ export class ZcodeAdapter extends LlmAdapter {
   private readonly processConfig: ZcodeProcessConfig
   private readonly sessions: SessionRegistry
   private readonly retryPolicy: ResolvedRetryPolicy
+  private readonly resolveWorkspaceRoot: ZcodeAdapterDeps['resolveWorkspaceRoot']
 
   constructor(config: Config, deps: ZcodeAdapterDeps) {
     super()
     this.config = config
     this.logger = deps.logger
+    this.resolveWorkspaceRoot = deps.resolveWorkspaceRoot
     this.provider = nonEmpty(config.provider) ?? 'zcode'
     this.model = nonEmpty(config.model) ?? DEFAULT_MODEL
-    this.catalog = config.models !== undefined && config.models.length > 0 ? config.models : DEFAULT_MODELS
+    // One catalog builder for both the adapter and the test/tool surface: the
+    // configured `model` is merged in even when `models` omits it, so a profile
+    // that sets only `model` never fails `resolveModel` with MODEL_NOT_FOUND.
+    this.catalog = configuredModels({ model: config.model, models: config.models ?? DEFAULT_MODELS })
     this.toolPolicy = config.toolPolicy ?? 'reject'
     this.processConfig = {
       nodePath: nonEmpty(config.nodePath) ?? DEFAULT_NODE_PATH,
@@ -278,9 +305,7 @@ export class ZcodeAdapter extends LlmAdapter {
    * preference, not a capability statement.
    */
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    const visible = new Set(this.config.visibleModels ?? [])
-    return this.catalog
-      .filter(entry => visible.size === 0 || visible.has(entry.id))
+    return filterVisibleModels(this.catalog, this.config.visibleModels)
       .map(entry => this.modelInfo(provider, entry))
   }
 
@@ -404,20 +429,14 @@ export class ZcodeAdapter extends LlmAdapter {
 
     try {
       const prompt = this.buildPrompt(options, resume)
-      if (prompt.length > PROMPT_ARGV_MAX_CHARS) {
+      failure = this.admissionFailure(options, prompt)
+      const cwd = failure === undefined ? await this.resolveCwd(conversationId) : undefined
+      if (failure === undefined && cwd === undefined) {
         failure = {
-          code: 'ZCODE_UNKNOWN',
-          message: `The rendered prompt is ${prompt.length} characters, above the ${PROMPT_ARGV_MAX_CHARS}-character ceiling `
-            + 'this route can pass on a Windows command line (32767 total). '
-            + 'The ZCode CLI accepts a one-shot prompt only as an argv entry, and this adapter will not truncate history.',
-        }
-      }
-      if (this.toolPolicy === 'dsh-owned' && (options.tools?.length ?? 0) > 0) {
-        failure = {
-          code: 'UNSUPPORTED_TOOLS',
-          message: `toolPolicy "dsh-owned" is not implemented: this version does not emit tool-call frames, `
-            + `so ${options.tools?.length ?? 0} declared tool(s) cannot be projected back to DSH. `
-            + 'Use "zcode-owned" (ZCode runs its own tools) or "reject" (no tools).',
+          code: 'WORKSPACE_UNAVAILABLE',
+          message: 'The session workspace root could not be resolved through the host workspace registry, '
+            + 'so this turn was not started. Running the child in the DSH install directory instead would point '
+            + 'ZCode at the wrong project; check that the session has a workspace and that it still exists.',
         }
       }
       if (failure === undefined && prompt.length > PROMPT_ARGV_WARN_CHARS) {
@@ -430,15 +449,17 @@ export class ZcodeAdapter extends LlmAdapter {
         })
       }
 
-      if (failure === undefined) {
+      if (failure === undefined && cwd !== undefined) {
         const run = runZcode({
           config: this.processConfig,
           prompt,
-          // `GenerateOptions` carries no workspace: the child inherits the
-          // host's directory. Documented in the module header (Unresolved).
-          cwd: process.cwd(),
+          // Always the session's workspace root, never `process.cwd()`: the child
+          // resolves relative paths and edits against the project the user opened.
+          cwd,
+          passEnv: this.config.passEnv ?? [],
           ...(resume && recorded !== undefined ? { sessionId: recorded.sessionId, resume: true } : {}),
           signal: abort.signal,
+          onDiagnostic: (record: unknown) => this.logger(record),
           onStdoutLine: (line: string) => {
             if (capture.length < STDOUT_RECOVERY_MAX_CHARS) capture += `${line}\n`
             push(parser.pushLine(line))
@@ -507,7 +528,7 @@ export class ZcodeAdapter extends LlmAdapter {
         const result = await outcome
         if (failure === undefined) {
           if (toolFrame !== undefined) failure = this.toolFailure(toolFrame)
-          else if (!result.ok) failure = this.processFailure(result.error, abortCause, resume)
+          else if (!result.ok) failure = this.processFailure(result.error, abortCause, resume, conversationId)
         }
       }
     } finally {
@@ -625,8 +646,89 @@ export class ZcodeAdapter extends LlmAdapter {
     recordQuotaObservation({ providerCode, requestId: error.requestId })
   }
 
+  /**
+   * Pre-spawn admission: refuse what this route cannot honor instead of letting
+   * the CLI ignore it. Every branch here runs before `runZcode`, so a refused
+   * request never spends a quota unit or leaves a process behind.
+   */
+  private admissionFailure(options: GenerateOptions, prompt: string): LlmFailure | undefined {
+    if (prompt.length > PROMPT_ARGV_MAX_CHARS) {
+      return {
+        code: 'ZCODE_UNKNOWN',
+        message: `The rendered prompt is ${prompt.length} characters, above the ${PROMPT_ARGV_MAX_CHARS}-character ceiling `
+          + 'this route can pass on a Windows command line (32767 total). '
+          + 'The ZCode CLI accepts a one-shot prompt only as an argv entry, and this adapter will not truncate history.',
+      }
+    }
+    const unsupported = unsupportedOptions(options)
+    if (unsupported.length > 0) {
+      return {
+        code: 'UNSUPPORTED_OPTION',
+        message: `ZCode 0.17.0 has no channel for ${unsupported.join(', ')}; `
+          + 'this adapter refuses the request instead of silently dropping the setting. '
+          + 'Remove these fields or use a route that supports them.',
+      }
+    }
+    const toolCount = options.tools?.length ?? 0
+    if (toolCount > 0 && this.toolPolicy !== 'zcode-owned') {
+      return this.toolPolicy === 'dsh-owned'
+        ? {
+            code: 'UNSUPPORTED_TOOLS',
+            message: `toolPolicy "dsh-owned" is not implemented: this version does not emit tool-call frames, `
+              + `so ${toolCount} declared tool(s) cannot be projected back to DSH. `
+              + 'Use "zcode-owned" (ZCode runs its own tools) or "reject" (no tools).',
+          }
+        : {
+            code: 'UNSUPPORTED_TOOLS',
+            message: `toolPolicy "reject" refuses ${toolCount} declared tool schema(s) before the process starts: `
+              + 'this route cannot project tool calls back to DSH. '
+              + 'Use "zcode-owned" (ZCode runs its own tools) or remove the tools from the request.',
+          }
+    }
+    if (this.toolPolicy === 'reject') {
+      const media = countMediaBlocks(options.messages)
+      if (media > 0) {
+        return {
+          code: 'UNSUPPORTED_CONTENT',
+          message: `toolPolicy "reject" refuses ${media} image/file block(s) before the process starts: `
+            + 'this route is text-only, and dropping the attachment silently would answer a different question. '
+            + 'Use "zcode-owned" or "dsh-owned" to receive placeholder text for attachments.',
+        }
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Ask the host for the session workspace root.
+   *
+   * A missing resolver, a missing session, a deleted directory or a throwing
+   * registry all collapse to `undefined`; the caller fails closed with
+   * `WORKSPACE_UNAVAILABLE` rather than guessing a directory.
+   */
+  private async resolveCwd(conversationId: string | undefined): Promise<string | undefined> {
+    if (conversationId === undefined || this.resolveWorkspaceRoot === undefined) return undefined
+    try {
+      const root = await this.resolveWorkspaceRoot(conversationId)
+      const trimmed = root?.trim()
+      return trimmed === undefined || trimmed.length === 0 ? undefined : trimmed
+    } catch (error) {
+      this.logger({
+        kind: 'zcode.workspace.resolve.failed',
+        conversationId,
+        message: error instanceof Error ? error.message : String(error),
+      })
+      return undefined
+    }
+  }
+
   /** Map a process-layer failure, keeping a caller cancellation distinguishable. */
-  private processFailure(error: unknown, abortCause: AbortCause | undefined, resume: boolean): LlmFailure {
+  private processFailure(
+    error: unknown,
+    abortCause: AbortCause | undefined,
+    resume: boolean,
+    conversationId: string | undefined,
+  ): LlmFailure {
     if (isZcodeError(error)) this.noteQuotaObservation(error)
     const failure = isZcodeError(error) ? toLlmFailure(error) : {
       code: 'ZCODE_UNKNOWN' as const,
@@ -635,11 +737,21 @@ export class ZcodeAdapter extends LlmAdapter {
     if (abortCause === 'caller') {
       return { code: 'ABORTED', message: 'The ZCode request was cancelled by the caller' }
     }
-    if (resume && DROPS_SESSION_ON.has(failure.code)) {
+    if (resume && conversationId !== undefined && DROPS_SESSION_ON.has(failure.code)) {
       // A dead id fails identically on the next attempt, and retrying it in full
       // mode would spend another quota unit on a guess (registered deviation
-      // D-b). Drop the record so the next turn starts clean.
-      this.logger({ kind: 'zcode.session.stale', code: failure.code })
+      // D-b). Drop the record so the next turn starts clean — logging alone left
+      // resume mode reusing the dead id forever.
+      this.logger({ kind: 'zcode.session.stale', code: failure.code, conversationId })
+      try {
+        this.sessions.delete(conversationId)
+      } catch (forgetError) {
+        this.logger({
+          kind: 'zcode.session.forget.failed',
+          conversationId,
+          message: forgetError instanceof Error ? forgetError.message : String(forgetError),
+        })
+      }
     }
     return failure
   }
@@ -741,6 +853,29 @@ export class ZcodeAdapter extends LlmAdapter {
  */
 const DROPS_SESSION_ON: ReadonlySet<string> = new Set(['ZCODE_EXIT', 'ZCODE_PARSE', 'ZCODE_UNKNOWN'])
 
+/**
+ * Request fields this route has no channel for, rendered for the failure
+ * message. `stop: []` is a no-op and therefore accepted.
+ */
+function unsupportedOptions(options: GenerateOptions): string[] {
+  const found: string[] = []
+  if (options.temperature !== undefined) found.push(`temperature=${String(options.temperature)}`)
+  if (options.maxTokens !== undefined) found.push(`maxTokens=${String(options.maxTokens)}`)
+  if (options.stop !== undefined && options.stop.length > 0) found.push(`stop=${JSON.stringify(options.stop)}`)
+  return found
+}
+
+/** Number of image/file blocks anywhere in the request history. */
+function countMediaBlocks(messages: readonly RequestMessage[]): number {
+  let count = 0
+  for (const message of messages) {
+    for (const block of message.content) {
+      if (block.type === 'image' || block.type === 'file') count += 1
+    }
+  }
+  return count
+}
+
 /** Heading of one transcript message. The CLI sees plain text, so roles must be labeled. */
 function roleHeading(message: RequestMessage): string {
   switch (message.role) {
@@ -833,9 +968,12 @@ function toLlmFailure(error: ZcodeError): LlmFailure {
   if (error.responseStatus !== undefined) details.push(`responseStatus=${error.responseStatus}`)
   if (error.requestId !== undefined) details.push(`request-id=${error.requestId}`)
   if (error.stderrTail !== undefined) details.push(`stderr=${error.stderrTail}`)
+  const rendered = details.length === 0 ? error.message : `${error.message} (${details.join('; ')})`
   return {
     code: error.code,
-    message: details.length === 0 ? error.message : `${error.message} (${details.join('; ')})`,
+    // Third-party text reaches logs and the transcript: redact credentials and
+    // cap the total, or one upstream dump can flood both.
+    message: boundDiagnostic(rendered),
     ...(error.responseStatus === undefined ? {} : { status: error.responseStatus }),
   }
 }

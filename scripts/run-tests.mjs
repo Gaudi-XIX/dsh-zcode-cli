@@ -48,11 +48,130 @@ if (!existsSync(tsc)) {
 }
 
 /** Directories whose text files AC11 covers. */
-const TEXT_ROOTS = ['src', 'tests', 'scripts']
+const TEXT_ROOTS = ['src', 'tests', 'scripts', 'docs']
 /** Root-level text files AC11 covers, when present. */
 const TEXT_FILES = ['package.json', 'tsconfig.json', 'README.md', 'cordis.patch.yml']
 /** Extensions treated as text. */
 const TEXT_EXTENSIONS = ['.ts', '.mjs', '.js', '.json', '.md', '.yml']
+
+/**
+ * The test corpus, named explicitly.
+ *
+ * Discovery is recursive, so a test dropped into `tests/unit/` still runs; the
+ * explicit set is what makes a *missing* or *renamed* file a gate failure
+ * instead of a quietly smaller run. Keep them in sync with the count declared in
+ * `docs/dsh-provider-contract.md` — the assertion below cross-checks the two.
+ */
+const EXPECTED_TEST_FILES = [
+  'adapter.test.mjs',
+  'argv.test.mjs',
+  'doctor.test.mjs',
+  'env.test.mjs',
+  'error-codes.test.mjs',
+  'parser.test.mjs',
+  'process.test.mjs',
+  'register.test.mjs',
+  'session.test.mjs',
+]
+
+/**
+ * Recursively collect `*.test.mjs` under the tests directory.
+ *
+ * @param {string} directory - Absolute directory to walk.
+ * @returns {string[]} Absolute paths, slash-normalised for comparison.
+ */
+function discoverTests(directory) {
+  const found = []
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const full = join(directory, entry.name)
+    if (entry.isDirectory()) {
+      if (entry.name !== 'node_modules') found.push(...discoverTests(full))
+    } else if (entry.name.endsWith('.test.mjs')) {
+      found.push(full)
+    }
+  }
+  return found
+}
+
+/**
+ * Read the declared test count out of the contract document.
+ *
+ * The doc line is the human-readable declaration; parsing it keeps the gate from
+ * silently drifting away from the document reviewers read.
+ *
+ * @returns {number | undefined} The declared count, when the line is present.
+ */
+function declaredTestCount() {
+  const document = join(root, 'docs', 'dsh-provider-contract.md')
+  if (!existsSync(document)) return undefined
+  const match = readFileSync(document, 'utf8').match(/测试面：[^\n]*共 \*\*(\d+)\*\*/)
+  return match === undefined || match === null ? undefined : Number.parseInt(match[1], 10)
+}
+
+/**
+ * The controlled-file count the contract doc declares, when present.
+ *
+ * @returns {number | undefined} The declared count.
+ */
+function declaredControlledFileCount() {
+  const document = join(root, 'docs', 'dsh-provider-contract.md')
+  if (!existsSync(document)) return undefined
+  const match = readFileSync(document, 'utf8').match(/受控文件：[^\n]*共 \*\*(\d+)\*\*/)
+  return match === undefined || match === null ? undefined : Number.parseInt(match[1], 10)
+}
+
+/**
+ * Count the tracked files. `git` is the single source of truth here: a new file
+ * that nobody staged is, by definition, not part of the controlled set.
+ *
+ * @returns {number | undefined} `undefined` when git cannot answer.
+ */
+function actualControlledFileCount() {
+  const result = spawnSync('git', ['-C', root, 'ls-files'], { encoding: 'utf8' })
+  if (result.error !== undefined || result.status !== 0) return undefined
+  return result.stdout.split('\n').filter((line) => line.trim() !== '').length
+}
+
+/**
+ * Fail when a published entry point points at a file the build did not produce.
+ *
+ * AC1 is otherwise unguarded: `main`/`types`/`exports` are strings in JSON, and a
+ * stale one only surfaces when the host fails to load the plugin.
+ *
+ * @returns {string[]} One message per broken target, empty when clean.
+ */
+function findBrokenEntryPoints() {
+  const problems = []
+  const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+  const targets = []
+  if (typeof manifest.main === 'string') targets.push(['main', manifest.main])
+  if (typeof manifest.types === 'string') targets.push(['types', manifest.types])
+  const walkExports = (value, where) => {
+    if (typeof value === 'string') targets.push([where, value])
+    else if (value !== null && typeof value === 'object') {
+      for (const [key, nested] of Object.entries(value)) walkExports(nested, `${where}.${key}`)
+    }
+  }
+  walkExports(manifest.exports, 'exports')
+  walkExports(manifest.dsh?.bundle, 'dsh.bundle')
+  for (const [label, target] of targets) {
+    // Node accepts both `lib/index.js` and `./lib/index.js` for `main`; only a
+    // package-relative path is legitimate, so absolute paths and URLs fail.
+    const relative = target.startsWith('./') ? target.slice(2) : target
+    if (relative.startsWith('/') || /^[A-Za-z]:[\\/]/.test(relative) || relative.includes('://')) {
+      problems.push(`${label} must be a package-relative path, got ${target}`)
+      continue
+    }
+    if (!existsSync(join(root, relative))) problems.push(`${label} points at missing ${target}`)
+  }
+  // AC10: the runtime dependency list is frozen at zero; a new entry here would
+  // need its own review, so the gate refuses one rather than trusting a diff.
+  const dependencies = manifest.dependencies ?? {}
+  if (Object.keys(dependencies).length > 0) {
+    problems.push(`dependencies must stay empty, found ${Object.keys(dependencies).join(', ')}`)
+  }
+  return problems
+}
 
 /**
  * AC11: every text file is LF-only and carries no BOM.
@@ -109,15 +228,69 @@ process.stdout.write('  all text files are LF without BOM\n')
 if (!step('typecheck', [tsc, '-p', 'tsconfig.json', '--noEmit'])) process.exit(1)
 if (!step('build', [tsc, '-p', 'tsconfig.json'])) process.exit(1)
 
-const files = readdirSync(testsDir)
-  .filter(name => name.endsWith('.test.mjs'))
-  .sort()
-  .map(name => join(testsDir, name))
-
-if (files.length === 0) {
-  process.stderr.write('No tests/*.test.mjs files were found — refusing to report success.\n')
+process.stdout.write('\n── package entry points\n')
+const entryProblems = findBrokenEntryPoints()
+if (entryProblems.length > 0) {
+  for (const problem of entryProblems) process.stderr.write(`  ${problem}\n`)
+  process.stderr.write(`\nentry-point check failed: ${entryProblems.length} problem(s)\n`)
   process.exit(1)
 }
+process.stdout.write('  main/types/exports and the bundle patch exist; dependencies stay empty\n')
+
+process.stdout.write('\n── controlled file count\n')
+const declaredFiles = declaredControlledFileCount()
+const actualFiles = actualControlledFileCount()
+if (actualFiles === undefined) {
+  process.stdout.write('  git is unavailable in this checkout; count check skipped\n')
+} else if (declaredFiles === undefined) {
+  process.stderr.write(
+    'docs/dsh-provider-contract.md is missing the "受控文件：… 共 **N**" declaration.\n',
+  )
+  process.exit(1)
+} else if (declaredFiles !== actualFiles) {
+  process.stderr.write(
+    `controlled-file count drift: docs declare ${declaredFiles}, git tracks ${actualFiles}\n`,
+  )
+  process.exit(1)
+} else {
+  process.stdout.write(`  ${actualFiles} tracked files match the declaration\n`)
+}
+
+const discovered = discoverTests(testsDir)
+const files = discovered.slice().sort()
+const names = files.map(file => file.slice(testsDir.length + 1).replace(/\\/g, '/'))
+
+if (files.length === 0) {
+  process.stderr.write('No tests/**/*.test.mjs files were found — refusing to report success.\n')
+  process.exit(1)
+}
+
+// The declared count and the real corpus must agree: a deleted or renamed test
+// otherwise shrinks the gate silently, which is the failure mode this replaces.
+const declared = declaredTestCount()
+if (declared === undefined) {
+  process.stderr.write(
+    'docs/dsh-provider-contract.md is missing the "测试面：… 共 **N**" declaration; '
+    + 'refusing to guess the expected test count.\n',
+  )
+  process.exit(1)
+}
+if (declared !== names.length) {
+  process.stderr.write(
+    `test count drift: docs declare ${declared}, tests/ holds ${names.length} (${names.join(', ')})\n`,
+  )
+  process.exit(1)
+}
+
+const missing = EXPECTED_TEST_FILES.filter(name => !names.includes(name))
+const extra = names.filter(name => !EXPECTED_TEST_FILES.includes(name))
+if (missing.length > 0 || extra.length > 0) {
+  process.stderr.write(
+    `test corpus drift: missing [${missing.join(', ')}], unexpected [${extra.join(', ')}]\n`,
+  )
+  process.exit(1)
+}
+process.stdout.write(`  ${names.length} test files match the declared corpus\n`)
 
 // `--test-reporter=spec` keeps the per-test lines readable when the suite grows.
 const ok = step('tests', ['--test', '--test-reporter=spec', ...files])

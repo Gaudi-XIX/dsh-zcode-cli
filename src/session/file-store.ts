@@ -17,6 +17,7 @@
  * two writes: a torn JSON file would then be the *only* copy, and the loader
  * would have to guess what half a record means.
  */
+import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
@@ -71,6 +72,16 @@ export function sessionStorePath(configured: string | undefined, env: DshEnv = p
   return isAbsolute(trimmed) ? trimmed : resolve(trimmed)
 }
 
+/** The fs surface {@link FileSessionStore} writes through (tests inject spies). */
+export interface FileStoreFs {
+  readonly mkdirSync: typeof mkdirSync
+  readonly writeFileSync: typeof writeFileSync
+  readonly renameSync: typeof renameSync
+  readonly rmSync: typeof rmSync
+}
+
+const REAL_FS: FileStoreFs = { mkdirSync, writeFileSync, renameSync, rmSync }
+
 /** Options of {@link FileSessionStore}. */
 export interface FileSessionStoreOptions {
   /** Clock override for retention tests. */
@@ -79,6 +90,8 @@ export interface FileSessionStoreOptions {
   readonly maxRecords?: number | undefined
   /** Age ceiling; defaults to {@link SESSION_MAX_AGE_MS}. */
   readonly maxAgeMs?: number | undefined
+  /** Filesystem seam; defaults to `node:fs` (tests observe the write sequence). */
+  readonly fs?: FileStoreFs | undefined
 }
 
 interface SessionFilePayload {
@@ -113,6 +126,7 @@ export class FileSessionStore implements EnumerableSessionStore {
   private readonly now: () => number
   private readonly maxRecords: number
   private readonly maxAgeMs: number
+  private readonly fs: FileStoreFs
   private loaded = false
   private saveError: string | undefined
   private loadError: string | undefined
@@ -124,6 +138,7 @@ export class FileSessionStore implements EnumerableSessionStore {
     this.now = options.now ?? (() => Date.now())
     this.maxRecords = options.maxRecords ?? SESSION_MAX_RECORDS
     this.maxAgeMs = options.maxAgeMs ?? SESSION_MAX_AGE_MS
+    this.fs = options.fs ?? REAL_FS
   }
 
   /** Why the last load produced an empty map, when it did. */
@@ -240,29 +255,24 @@ export class FileSessionStore implements EnumerableSessionStore {
       version: ZCODE_SESSION_FILE_VERSION,
       records: [...this.records.values()].sort((left, right) => left.conversationId.localeCompare(right.conversationId)),
     }
-    const temporary = `${this.path}.tmp-${process.pid}-${this.nextWriteId()}`
+    // Unpredictable temp name: a concurrent writer (or a local attacker) must
+    // not be able to plant `sessions.json.tmp-<pid>-<n>` and win the rename.
+    const temporary = `${this.path}.tmp-${process.pid}-${randomUUID()}`
     try {
-      mkdirSync(dirname(this.path), { recursive: true })
-      writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
-      renameSync(temporary, this.path)
+      this.fs.mkdirSync(dirname(this.path), { recursive: true })
+      this.fs.writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+      this.fs.renameSync(temporary, this.path)
       this.saveError = undefined
     } catch (error) {
       this.saveError = describe(error)
       // Best effort: a leftover temp file must not turn into a leak per turn.
       try {
-        rmSync(temporary, { force: true })
+        this.fs.rmSync(temporary, { force: true })
       } catch {
         // Nothing further to do; the next write uses a fresh name.
       }
     }
   }
-
-  private nextWriteId(): number {
-    this.writeId += 1
-    return this.writeId
-  }
-
-  private writeId = 0
 }
 
 function describe(error: unknown): string {

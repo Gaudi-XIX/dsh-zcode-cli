@@ -60,6 +60,8 @@ export interface Config {
   sessionMode?: 'resume' | 'full'
   /** Durable sessionId to conversationId map path; empty uses DSH_HOME/zcode-provider/sessions.json. */
   sessionStorePath?: string
+  /** Extra host environment variable names the child may inherit (closed allowlist otherwise). */
+  passEnv?: string[]
   /** Image input mode. */
   imageInput?: ZcodeImageInput
   /** Node executable that runs the ZCode entry script. */
@@ -171,6 +173,7 @@ export function createConfigSchema(defaults: {
     mode: z.union(['guarded'] as const).default('guarded').description('CLI permission mode (fixed: guarded; yolo auto-approves every tool call)'),
     sessionMode: z.union(['resume', 'full'] as const).default('full').description('Session mode: full replays history, resume reuses a ZCode session id'),
     sessionStorePath: z.string().default('').description('Durable sessionId to conversationId map path; empty uses DSH_HOME/zcode-provider/sessions.json'),
+    passEnv: z.array(z.string().pattern(/^[A-Za-z_][A-Za-z0-9_]*$/)).default([]).description('Extra host environment variable names passed to the ZCode child; the allowlist is closed by default').hidden(),
     imageInput: z.union(['off', 'experimental'] as const).default('off').description('Image input mode'),
     nodePath: z.string().pattern(/^\S(?:.*\S)?$/).default(DEFAULT_NODE_PATH).description('Node executable that runs the CLI; ZCode 0.17.0 needs node:sqlite, i.e. Node >= 22').hidden(),
     zcodeCjsPath: z.string().pattern(/^\S(?:.*\S)?$/).default(DEFAULT_ZCODE_CJS_PATH).description('ZCode CLI entry script (resources/glm/zcode.cjs)').hidden(),
@@ -201,6 +204,7 @@ export function createConfigSchema(defaults: {
       mode: { $description: 'CLI 权限模式（固定 guarded；yolo 会自动批准所有工具调用）' },
       sessionMode: { $description: '会话模式：full=每轮完整历史, resume=复用 ZCode 会话 ID' },
       sessionStorePath: { $description: '会话映射（DSH 会话→ZCode 会话）的落盘路径；留空用 DSH_HOME/zcode-provider/sessions.json，让 resume 模式在宿主重启后仍能续话' },
+      passEnv: { $description: '额外允许传给 ZCode 子进程的宿主环境变量名；默认白名单之外一律不继承' },
       imageInput: { $description: '图片输入：off=关闭, experimental=实验通道' },
       nodePath: { $description: '运行 CLI 的 Node 可执行文件路径；ZCode 0.17.0 需要 node:sqlite，即 Node >= 22' },
       zcodeCjsPath: { $description: 'ZCode CLI 入口脚本（resources/glm/zcode.cjs）' },
@@ -225,6 +229,7 @@ export function createConfigSchema(defaults: {
       mode: { $description: 'CLI permission mode (fixed to guarded; yolo auto-approves every tool call)' },
       sessionMode: { $description: 'Session mode: full or resume' },
       sessionStorePath: { $description: 'Path of the durable DSH session to ZCode session map; empty uses DSH_HOME/zcode-provider/sessions.json so resume keeps working after a host restart' },
+      passEnv: { $description: 'Extra host environment variable names inherited by the ZCode child; everything outside the allowlist is dropped' },
       imageInput: { $description: 'Image input: off, or the experimental channel' },
       nodePath: { $description: 'Node executable that runs the CLI; ZCode 0.17.0 needs node:sqlite, i.e. Node >= 22' },
       zcodeCjsPath: { $description: 'ZCode CLI entry script (resources/glm/zcode.cjs)' },
@@ -250,11 +255,31 @@ export const Config: z<Config> = createConfigSchema({ enabled: false, toolPolicy
 export const BundleConfig: z<Config> = createConfigSchema({ enabled: true, toolPolicy: 'reject' })
 
 /**
+ * Read a boolean config value that may be a volatile reference.
+ *
+ * `enabled` carries `.volatile()` so a settings change takes effect without a
+ * restart. The host then hands `apply()` the reference object rather than the
+ * primitive, and `reference === true` is *always* false — the exact bug that
+ * kept the adapter unregistered. Both shapes are accepted here: a primitive
+ * (programmatic config, tests) and any reference exposing a callable `get()`.
+ */
+export function configBoolean(value: unknown): boolean {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'object' && value !== null) {
+    const getter = (value as { get?: unknown }).get
+    if (typeof getter === 'function') return configBoolean((getter as () => unknown).call(value))
+  }
+  return false
+}
+
+/**
  * Resolve the effective catalog. Catalog membership is advisory; unknown exact
  * model ids remain valid request targets and are handled by the adapter's
  * resolveModel().
  */
-export function configuredModels(config: Pick<Config, 'model' | 'models'> = {}): readonly ModelConfig[] {
+export function configuredModels(
+  config: { readonly model?: string | undefined; readonly models?: readonly ModelConfig[] | undefined } = {},
+): readonly ModelConfig[] {
   const fallbackId = config.model?.trim() || DEFAULT_MODEL
   const entries = config.models !== undefined && config.models.length > 0
     ? config.models
