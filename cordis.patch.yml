@@ -1,0 +1,21 @@
+# Bundle entry is enabled by default when installed through dsh plugin add.
+# Install this package into a DSH profile with:
+# npx @deepseek-ai/dsh plugin --profile desktop add dsh-zcode-provider
+#
+# Every key below matches the Config schema in src/provider/config.ts. The
+# ZCode environment contract (ZCODE_HOME / ZCODE_DATA_BASE_DIR /
+# ZCODE_BUILTIN_PROVIDER_CONFIG_FILE / ZCODE_PERSONAL_PROVIDER_CONFIG_FILE /
+# NODE_OPTIONS) is NOT config: it is asserted fail-closed at request time by
+# assertEnvContract() in src/zcode/process.ts, and must be supplied by whoever
+# launches the DSH host. See the handoff for the per-entry expected values.
+- insert:
+    - id: dsh-zcode-provider
+      name: dsh-zcode-provider
+      config:
+        enabled: true
+        provider: zcode
+        model: GLM-5.3-Flash
+        toolPolicy: reject
+        mode: guarded
+        sessionMode: full
+        imageInput: off
