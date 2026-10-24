@@ -204,7 +204,7 @@ export function createConfigSchema(defaults: {
   toolPolicy?: ZcodeToolPolicy
 } = {}): z<Config> {
   const defaultEnabled = defaults.enabled ?? false
-  const defaultToolPolicy = defaults.toolPolicy ?? 'reject'
+  const defaultToolPolicy = defaults.toolPolicy ?? 'dsh-owned'
 
   const schemaBase = z.object({
     enabled: z.boolean().default(defaultEnabled).description('Enable ZCode provider').volatile(),
@@ -305,10 +305,10 @@ export function createConfigSchema(defaults: {
 }
 
 /** Programmatic library default: enabled=false, toolPolicy=reject. */
-export const Config: z<Config> = createConfigSchema({ enabled: false, toolPolicy: 'reject' })
+export const Config: z<Config> = createConfigSchema({ enabled: false, toolPolicy: 'dsh-owned' })
 
 /** Bundle default for DSH profile plugin add: enabled=true, tools rejected. */
-export const BundleConfig: z<Config> = createConfigSchema({ enabled: true, toolPolicy: 'reject' })
+export const BundleConfig: z<Config> = createConfigSchema({ enabled: true, toolPolicy: 'dsh-owned' })
 
 /**
  * Read a boolean config value that may be a volatile reference.

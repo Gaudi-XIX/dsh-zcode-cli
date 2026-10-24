@@ -66,8 +66,8 @@ class ZcodeAdapter extends LlmAdapter {
 `GenerateOptions` 是 DSH 已组装的无提供方请求：`provider`、`model`、`messages`、`system`、`tools`、`temperature`、`maxTokens`、`stop`、`reasoningEffort`、`signal`、`sessionId`、`purpose`。
 
 - `signal` 必须尊重：取消即终止子进程，映射为 `ABORTED`。
-- 不支持的字段不能静默丢弃，必须抛带稳定 code 的 `ZcodeError`。默认 `toolPolicy: reject` 下，非空 `tools` 报 `UNSUPPORTED_TOOLS`，image/file block 报 `UNSUPPORTED_CONTENT`——两条在 spawn 之前生效（`channel: cli`）或在开 socket 之前生效（`channel: free|paid`）。`temperature` / `maxTokens` / 非空 `stop` **只在 `channel: cli`** 报 `UNSUPPORTED_OPTION`：CLI 的 `-p` 协议没有这三个字段的入口；两个 HTTP 通道把它们原样放进请求体（见「传输通道」）。
-- `toolPolicy: zcode-owned` 丢弃 DSH 的工具 schema 后继续；`dsh-owned` 拒绝 tools（投影 tool call 需要本版不产出的分片）。两种宽松策略下 image/file 投影为占位文本（`[图片附件 … 图片内容未发送]`），不静默丢失。
+- 不支持的字段不能静默丢弃，必须抛带稳定 code 的 `ZcodeError`。默认 `toolPolicy: dsh-owned` 下工具 schema 照常下发并投影回 DSH；`reject` 下非空 `tools` 报 `UNSUPPORTED_TOOLS`，image/file block 报 `UNSUPPORTED_CONTENT`——两条在 spawn 之前生效（`channel: cli`）或在开 socket 之前生效（`channel: free|paid`）。`temperature` / `maxTokens` / 非空 `stop` **只在 `channel: cli`** 报 `UNSUPPORTED_OPTION`：CLI 的 `-p` 协议没有这三个字段的入口；两个 HTTP 通道把它们原样放进请求体（见「传输通道」）。
+- `toolPolicy: dsh-owned`（默认）把 DSH 的工具 schema 下发，端点回的 `tool_use` 投影成 `block-start(tool-call) → tool-call-delta* → block-end(tool-call)` 并以 `finish{tool-calls}` 收尾；`zcode-owned` 丢弃 schema 后继续，但端点若仍回 `tool_use` 则 fail-closed；`reject` 直接拒绝带 tools 的回合。两种宽松策略下 image/file 投影为占位文本（`[图片附件 … 图片内容未发送]`），不静默丢失。
 - `reasoningEffort` 不映射到 CLI（`-p` 协议没有该通道）；HTTP 通道把它放进 `output_config.effort`，取值 `low|medium|high|max`，缺省 `high`。
 
 ## 传输通道（channel）
@@ -276,7 +276,7 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 
 测试面：`tests/` 下递归共 **12** 个 `*.test.mjs`，必须与脚本里的 `EXPECTED_TEST_FILES` 集合相等，也必须等于本行声明的数字（`declaredTestCount()` 解析本行）。少一个、多一个、改名一个都会让门禁在跑测试前就停——不允许「测试变少、门禁仍绿」。
 
-测试用例：`node --test` 汇总的用例总数共 **212** 个（`ℹ tests 212`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
+测试用例：`node --test` 汇总的用例总数共 **220** 个（`ℹ tests 220`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
 
 受控文件：`git ls-files` 共 **39** 个 = 15 个 `src/**` 源文件（`index.ts`、`diagnostics.ts`、`doctor.ts`、`selection.ts`、`provider/{config,error-codes,zcode}.ts`、`session/{file-store,store}.ts`、`web/router.ts`、`zcode/{billing,http-channel,parser,prefix,process}.ts`）+ 2 个 `client/` 源文件（`index.ts`、`locales.ts`）+ 12 个 `tests/**/*.test.mjs` + 3 个 `scripts/`（`run-tests.mjs`、`build-client.mjs`、`install-env.ps1`）+ 1 个 `docs/dsh-provider-contract.md` + 6 个根级文件（`.gitignore`、`README.md`、`cordis.patch.yml`、`package.json`、`tsconfig.json`、`tsconfig.client.json`）。门禁会拿 `git ls-files` 的实点数与这一行比对，改文件数必须同步改这行。
 

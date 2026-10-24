@@ -674,7 +674,7 @@ test('a tool_use stop reason is UNSUPPORTED_TOOLS, as on the CLI channel', async
 test('toolPolicy reject refuses tool schemas before the request opens', async (t) => {
   const calls = stubFetch(t, () => sseResponse(HAPPY_SSE))
   const tools = [{ name: 'Bash', description: 'run', parameters: { type: 'object', properties: {} } }]
-  const chunks = await collectChunks(httpAdapter(t).stream(httpRequest('hi', { tools })))
+  const chunks = await collectChunks(httpAdapter(t, { toolPolicy: 'reject' }).stream(httpRequest('hi', { tools })))
   assert.equal(finishFailure(chunks)?.code, 'UNSUPPORTED_TOOLS')
   assert.equal(calls.length, 0, 'a refused request must not reach the network')
 })
@@ -715,9 +715,254 @@ test('history keeps its roles and labels non-user turns', () => {
   assert.deepEqual(messages[1], { role: 'assistant', content: 'answer' })
 })
 
+test('an assistant tool call with no arguments projects as an empty input object', () => {
+  // A no-argument tool call reaches history without an `arguments` string. That
+  // used to raise `TypeError: Cannot read properties of undefined (reading
+  // 'trim')` and surface as an opaque ZCODE_UNKNOWN; it must project as `{}`.
+  const messages = toHttpMessages([
+    { role: 'user', content: [{ type: 'text', text: 'what time is it?' }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'call_1', name: 'get_time' }] },
+    { role: 'tool', toolCallId: 'call_1', content: [{ type: 'text', text: '{"time":"now"}' }] },
+  ])
+  assert.equal(messages.length, 3)
+  assert.equal(messages[0].content, 'what time is it?')
+  assert.deepEqual(messages[1].content, [
+    { type: 'tool-use', id: 'call_1', name: 'get_time', input: {} },
+  ])
+  assert.deepEqual(messages[2].content, [
+    { type: 'tool-result', toolUseId: 'call_1', content: '{"time":"now"}' },
+  ])
+})
+
 test('a transcript that would open with an assistant turn fails closed', () => {
   assert.throws(
     () => toHttpMessages([{ role: 'assistant', content: [{ type: 'text', text: 'earlier' }] }]),
     (error) => error instanceof ZcodeError && error.code === 'UNSUPPORTED_CONTENT',
   )
 })
+
+// ---------------------------------------------------------------------------
+// Tool calls over the Messages endpoint
+//
+// The endpoint speaks `tool_use` / `tool_result`; DSH speaks `tool-call` blocks
+// and a `tool-calls` finish. Every fixture below is a fixed frame list, so these
+// tests never touch the network: the mapping is what is under test, not ZCode.
+// ---------------------------------------------------------------------------
+
+/** `[[event, payload], ...]` → SSE text, with the JSON quoted by the runtime. */
+function sseFromFrames(frames) {
+  return frames.map(([event, payload]) => `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`).join('')
+}
+
+const GET_TIME_TOOL = {
+  name: 'get_time',
+  description: 'Return the current time in one zone',
+  parameters: { type: 'object', properties: { zone: { type: 'string' } }, required: ['zone'] },
+}
+
+/**
+ * One turn with a thinking block and two tool calls that interleave.
+ *
+ * Index 0 is thinking, 1 is `get_time`, 2 is `get_date`, and the argument
+ * chunks arrive out of order: the delta for index 1 lands after the start of
+ * index 2. Anything that accumulates into one shared buffer passes a single
+ * call by accident and corrupts this one.
+ */
+const INTERLEAVED_TOOL_FRAMES = [
+  ['message_start', { type: 'message_start', message: { usage: { input_tokens: 40 } } }],
+  ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }],
+  ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+  ['content_block_start', {
+    type: 'content_block_start',
+    index: 1,
+    content_block: { type: 'tool_use', id: 'toolu_a', name: 'get_time', input: {} },
+  }],
+  ['content_block_delta', {
+    type: 'content_block_delta',
+    index: 1,
+    delta: { type: 'input_json_delta', partial_json: '{"zone":' },
+  }],
+  ['content_block_start', {
+    type: 'content_block_start',
+    index: 2,
+    content_block: { type: 'tool_use', id: 'toolu_b', name: 'get_date', input: {} },
+  }],
+  ['content_block_delta', {
+    type: 'content_block_delta',
+    index: 2,
+    delta: { type: 'input_json_delta', partial_json: '{}' },
+  }],
+  ['content_block_delta', {
+    type: 'content_block_delta',
+    index: 1,
+    delta: { type: 'input_json_delta', partial_json: '"UTC"}' },
+  }],
+  ['content_block_stop', { type: 'content_block_stop', index: 1 }],
+  ['content_block_stop', { type: 'content_block_stop', index: 2 }],
+  ['message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } }],
+  ['message_stop', { type: 'message_stop' }],
+]
+
+test('declared tools go out as tools[].input_schema, and only when policy allows', async (t) => {
+  const { root, env } = await credentialRoot()
+  const calls = stubFetch(t, () => sseResponse(sseFromFrames(INTERLEAVED_TOOL_FRAMES)))
+  useEnv(t, { ZCODE_DATA_BASE_DIR: root, ZCODE_CREDENTIAL_SECRET: env.ZCODE_CREDENTIAL_SECRET })
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  await collectChunks(httpAdapter(t, { toolPolicy: 'dsh-owned' }).stream(httpRequest('time?', { tools: [GET_TIME_TOOL] })))
+
+  assert.deepEqual(calls[0].body.tools, [
+    { name: 'get_time', description: GET_TIME_TOOL.description, input_schema: GET_TIME_TOOL.parameters },
+  ])
+  // `input_schema` is the wire spelling; leaking `parameters` would be a schema
+  // the endpoint reads as absent.
+  assert.equal(Object.hasOwn(calls[0].body.tools[0], 'parameters'), false)
+})
+
+test('an empty tool list sends no tools key at all', async (t) => {
+  const { root, env } = await credentialRoot()
+  const calls = stubFetch(t, () => sseResponse(HAPPY_SSE))
+  useEnv(t, { ZCODE_DATA_BASE_DIR: root, ZCODE_CREDENTIAL_SECRET: env.ZCODE_CREDENTIAL_SECRET })
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  await collectChunks(httpAdapter(t, { toolPolicy: 'dsh-owned' }).stream(httpRequest('hi', { tools: [] })))
+
+  assert.equal(Object.hasOwn(calls[0].body, 'tools'), false)
+})
+
+test('interleaved tool_use blocks are accumulated per index and closed once each', async (t) => {
+  const { root, env } = await credentialRoot()
+  stubFetch(t, () => sseResponse(sseFromFrames(INTERLEAVED_TOOL_FRAMES)))
+  useEnv(t, { ZCODE_DATA_BASE_DIR: root, ZCODE_CREDENTIAL_SECRET: env.ZCODE_CREDENTIAL_SECRET })
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  const chunks = await collectChunks(
+    httpAdapter(t, { toolPolicy: 'dsh-owned' }).stream(httpRequest('time?', { tools: [GET_TIME_TOOL] })),
+  )
+
+  assert.deepEqual(chunks.map((chunk) => chunk.type), [
+    'block-start',
+    'tool-call-delta',
+    'block-start',
+    'tool-call-delta',
+    'tool-call-delta',
+    'block-end',
+    'block-end',
+    'usage',
+    'finish',
+  ])
+  const ends = chunks.filter((chunk) => chunk.type === 'block-end')
+  assert.deepEqual(ends.map((chunk) => chunk.block), [
+    { type: 'tool-call', id: 'toolu_a', name: 'get_time', arguments: '{"zone":"UTC"}' },
+    { type: 'tool-call', id: 'toolu_b', name: 'get_date', arguments: '{}' },
+  ])
+  // Each call owns its own DSH index; sharing one would make the second end
+  // close a block that belongs to the first.
+  assert.deepEqual(ends.map((chunk) => chunk.index), [0, 1])
+  assert.deepEqual(chunks.at(-1).reason, { kind: 'tool-calls' })
+})
+
+test('a tool_use block without content_block_stop still closes before finish', async (t) => {
+  const { root, env } = await credentialRoot()
+  const truncated = INTERLEAVED_TOOL_FRAMES.slice(0, 8)
+  stubFetch(t, () => sseResponse(sseFromFrames(truncated)))
+  useEnv(t, { ZCODE_DATA_BASE_DIR: root, ZCODE_CREDENTIAL_SECRET: env.ZCODE_CREDENTIAL_SECRET })
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  const chunks = await collectChunks(
+    httpAdapter(t, { toolPolicy: 'dsh-owned' }).stream(httpRequest('time?', { tools: [GET_TIME_TOOL] })),
+  )
+
+  // The answer is cut before either call stops, so the turn cannot succeed —
+  // but every block that started must still end before `finish` reaches DSH.
+  const types = chunks.map((chunk) => chunk.type)
+  assert.equal(types.filter((type) => type === 'block-start').length, 2)
+  assert.equal(types.filter((type) => type === 'block-end').length, 2)
+  assert.equal(types.at(-1), 'finish')
+})
+
+test('tool arguments that are not JSON fail the turn instead of reaching an executor', async (t) => {
+  const { root, env } = await credentialRoot()
+  const broken = [
+    ['message_start', { type: 'message_start', message: { usage: { input_tokens: 5 } } }],
+    ['content_block_start', {
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'tool_use', id: 'toolu_x', name: 'get_time', input: {} },
+    }],
+    ['content_block_delta', {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'input_json_delta', partial_json: '{"zone":' },
+    }],
+    ['content_block_stop', { type: 'content_block_stop', index: 1 }],
+    ['message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use' } }],
+    ['message_stop', { type: 'message_stop' }],
+  ]
+  stubFetch(t, () => sseResponse(sseFromFrames(broken)))
+  useEnv(t, { ZCODE_DATA_BASE_DIR: root, ZCODE_CREDENTIAL_SECRET: env.ZCODE_CREDENTIAL_SECRET })
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  const chunks = await collectChunks(
+    httpAdapter(t, { toolPolicy: 'dsh-owned' }).stream(httpRequest('time?', { tools: [GET_TIME_TOOL] })),
+  )
+
+  const finish = chunks.at(-1)
+  assert.equal(finish.type, 'finish')
+  assert.equal(finish.reason.kind, 'error')
+  assert.equal(finish.reason.failure.code, 'ZCODE_PARSE')
+})
+
+test('zcode-owned sends no schemas and fails closed if a tool_use arrives anyway', async (t) => {
+  const { root, env } = await credentialRoot()
+  const calls = stubFetch(t, () => sseResponse(sseFromFrames(INTERLEAVED_TOOL_FRAMES)))
+  useEnv(t, { ZCODE_DATA_BASE_DIR: root, ZCODE_CREDENTIAL_SECRET: env.ZCODE_CREDENTIAL_SECRET })
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  const chunks = await collectChunks(
+    httpAdapter(t, { toolPolicy: 'zcode-owned' }).stream(httpRequest('time?', { tools: [GET_TIME_TOOL] })),
+  )
+
+  assert.equal(Object.hasOwn(calls[0].body, 'tools'), false)
+  assert.equal(finishFailure(chunks)?.code, 'UNSUPPORTED_TOOLS')
+})
+
+test('a tool result goes back as a tool_result block paired by id', async () => {
+  const messages = toHttpMessages([
+    { role: 'user', content: [{ type: 'text', text: 'what time is it?' }] },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'Checking.' },
+        { type: 'tool-call', id: 'toolu_a', name: 'get_time', arguments: '{"zone":"UTC"}' },
+      ],
+    },
+    { role: 'tool', toolCallId: 'toolu_a', content: [{ type: 'text', text: '12:00' }] },
+    {
+      role: 'assistant',
+      content: [{ type: 'tool-call', id: 'toolu_b', name: 'get_date', arguments: '{}' }],
+    },
+    { role: 'tool', toolCallId: 'toolu_b', content: [{ type: 'text', text: 'boom' }], isError: true },
+  ])
+
+  assert.deepEqual(messages, [
+    { role: 'user', content: 'what time is it?' },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'Checking.' },
+        { type: 'tool-use', id: 'toolu_a', name: 'get_time', input: { zone: 'UTC' } },
+      ],
+    },
+    { role: 'user', content: [{ type: 'tool-result', toolUseId: 'toolu_a', content: '12:00' }] },
+    {
+      role: 'assistant',
+      content: [{ type: 'tool-use', id: 'toolu_b', name: 'get_date', input: {} }],
+    },
+    {
+      role: 'user',
+      content: [{ type: 'tool-result', toolUseId: 'toolu_b', content: 'boom', isError: true }],
+    },
+  ])
+})
+

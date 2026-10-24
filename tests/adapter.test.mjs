@@ -504,7 +504,8 @@ test('a missing environment contract fails closed before any spawn', async t => 
 
 test('reject policy refuses tools, sampling options and attachments before spawn', async t => {
   const before = argvLog().length
-  const instance = adapter(t)
+  // The shipped default is dsh-owned; this test is about the reject policy itself.
+  const instance = adapter(t, { toolPolicy: 'reject' })
 
   const media = {
     messages: [{

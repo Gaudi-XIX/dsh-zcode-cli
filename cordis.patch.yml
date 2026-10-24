@@ -15,7 +15,7 @@
         enabled: true
         provider: zcode
         model: GLM-5.3-Flash
-        toolPolicy: reject
+        toolPolicy: dsh-owned
         mode: guarded
         sessionMode: full
         imageInput: off

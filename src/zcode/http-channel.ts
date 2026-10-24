@@ -60,10 +60,35 @@ export const ZCODE_HTTP_DEFAULT_TIMEOUT_MS = 900_000
 /** The Anthropic protocol version both deployments accept. */
 export const ZCODE_ANTHROPIC_VERSION = '2023-06-01'
 
-/** One turn of conversation, already flattened to text by the adapter. */
+/**
+ * One content block of a Messages turn, in this module's own spelling.
+ *
+ * The wire names are `tool_use` / `tool_result`; the hyphens here keep the
+ * switch statements in the adapter readable, and {@link wireMessage} is the one
+ * place that translates. A turn that carries no tool block stays a plain string
+ * (see {@link ZcodeHttpMessage.content}) so a text-only request keeps the byte
+ * shape the live capture verified.
+ */
+export type ZcodeHttpContentBlock =
+  | { readonly type: 'text'; readonly text: string }
+  | { readonly type: 'tool-use'; readonly id: string; readonly name: string; readonly input: Record<string, unknown> }
+  | { readonly type: 'tool-result'; readonly toolUseId: string; readonly content: string; readonly isError?: boolean }
+
+/** A text-only turn is a string; anything carrying a tool block is a list. */
+export type ZcodeHttpContent = string | readonly ZcodeHttpContentBlock[]
+
+/** One turn of conversation, as the adapter hands it over. */
 export interface ZcodeHttpMessage {
   readonly role: 'user' | 'assistant'
-  readonly content: string
+  readonly content: ZcodeHttpContent
+}
+
+/** One tool declaration, already normalized to the Messages `tools[]` shape. */
+export interface ZcodeHttpTool {
+  readonly name: string
+  readonly description: string
+  /** JSON Schema object of the arguments (wire name `input_schema`). */
+  readonly inputSchema: Record<string, unknown>
 }
 
 /** Token counts as the endpoint reports them. */
@@ -74,10 +99,20 @@ export interface ZcodeHttpUsage {
   readonly cacheWriteTokens: number
 }
 
-/** One thing the adapter can act on while the answer streams in. */
+/**
+ * One thing the adapter can act on while the answer streams in.
+ *
+ * Block-scoped events carry the SSE `index` so a response that interleaves a
+ * thinking block, a text block and one or more `tool_use` blocks can be
+ * reassembled per block instead of linearly.
+ */
 export type ZcodeHttpEvent =
   | { readonly type: 'text'; readonly text: string }
   | { readonly type: 'thinking'; readonly text: string }
+  | { readonly type: 'tool-use-start'; readonly index: number; readonly id: string; readonly name: string }
+  | { readonly type: 'tool-use-delta'; readonly index: number; readonly partialJson: string }
+  /** A `content_block_stop`; the adapter closes whichever block it opened for this index. */
+  | { readonly type: 'block-stop'; readonly index: number }
   | { readonly type: 'usage'; readonly usage: ZcodeHttpUsage }
   | { readonly type: 'stop'; readonly reason: string | undefined }
 
@@ -90,6 +125,12 @@ export interface ZcodeHttpRequest {
   readonly messages: readonly ZcodeHttpMessage[]
   /** Caller system prompts, appended after the captured prefix blocks. */
   readonly system?: readonly string[]
+  /**
+   * Tools to declare to the endpoint. Omitted from the body when absent or
+   * empty: the captured request that carried no tools had no `tools` key at
+   * all, and an empty array is not the same request.
+   */
+  readonly tools?: readonly ZcodeHttpTool[]
   readonly maxTokens?: number
   /** Sampling temperature; omitted from the body when unset (the capture sent none). */
   readonly temperature?: number
@@ -212,6 +253,11 @@ export async function resolveZcodeHttpAuth(request: ZcodeHttpRequest): Promise<Z
   return { channel: request.channel, url, headers, deviceMid }
 }
 
+/** One turn's content as blocks; a text-only turn becomes its single text block. */
+function contentBlocksOf(content: ZcodeHttpContent): readonly ZcodeHttpContentBlock[] {
+  return typeof content === 'string' ? [{ type: 'text', text: content }] : content
+}
+
 /**
  * Merge adjacent same-role messages.
  *
@@ -219,18 +265,81 @@ export async function resolveZcodeHttpAuth(request: ZcodeHttpRequest): Promise<Z
  * where two user turns can sit back to back (tool results, injected reminders).
  * Merging keeps the request valid without dropping a turn, and it is
  * idempotent so a caller that already merged loses nothing.
+ *
+ * Blocks are concatenated, not flattened to text: two back-to-back
+ * `tool_result` turns must stay sibling blocks of one user turn, and joining
+ * their text would hand the endpoint `tool_result` JSON as prose.
  */
 export function mergeHttpMessages(messages: readonly ZcodeHttpMessage[]): readonly ZcodeHttpMessage[] {
   const merged: ZcodeHttpMessage[] = []
   for (const message of messages) {
     const previous = merged[merged.length - 1]
     if (previous !== undefined && previous.role === message.role) {
-      merged[merged.length - 1] = { role: previous.role, content: `${previous.content}\n\n${message.content}` }
+      merged[merged.length - 1] = {
+        role: previous.role,
+        content: collapseToText([...contentBlocksOf(previous.content), ...contentBlocksOf(message.content)]),
+      }
       continue
     }
-    merged.push({ role: message.role, content: message.content })
+    merged.push({ role: message.role, content: collapseToText(message.content) })
   }
   return merged
+}
+
+/**
+ * Keep a text-only turn a string.
+ *
+ * The wire accepts both shapes, but the captured turn sent prose as a bare
+ * string, and a turn that is nothing but text has no reason to differ from it.
+ * Only a turn carrying `tool_use` / `tool_result` needs the block array.
+ */
+function collapseToText(content: ZcodeHttpContent): ZcodeHttpContent {
+  const blocks = contentBlocksOf(content)
+  if (blocks.length === 0) return ''
+  if (!blocks.every(block => block.type === 'text')) return blocks
+  return blocks.map(block => (block.type === 'text' ? block.text : '')).join('\n\n')
+}
+
+/**
+ * Translate one turn to wire blocks.
+ *
+ * This is the only place the internal `tool-use` / `tool-result` spelling
+ * meets the wire's `tool_use` / `tool_result`. Adjacent text blocks are fused
+ * so a text-only turn keeps the exact single-block shape the live capture sent.
+ */
+function wireBlocks(content: ZcodeHttpContent): readonly Record<string, unknown>[] {
+  const blocks: Record<string, unknown>[] = []
+  const pushText = (text: string): void => {
+    const previous = blocks[blocks.length - 1]
+    if (previous !== undefined && previous['type'] === 'text') {
+      previous['text'] = `${String(previous['text'])}\n\n${text}`
+      return
+    }
+    blocks.push({ type: 'text', text })
+  }
+  for (const block of contentBlocksOf(content)) {
+    switch (block.type) {
+      case 'text':
+        pushText(block.text)
+        break
+      case 'tool-use':
+        blocks.push({ type: 'tool_use', id: block.id, name: block.name, input: block.input })
+        break
+      case 'tool-result': {
+        const wire: Record<string, unknown> = {
+          type: 'tool_result',
+          tool_use_id: block.toolUseId,
+          content: block.content,
+        }
+        // Only sent when true: the endpoint treats an explicit false as
+        // meaningful in some proxy layers, and a successful result is the default.
+        if (block.isError === true) wire['is_error'] = true
+        blocks.push(wire)
+        break
+      }
+    }
+  }
+  return blocks
 }
 
 /** The `system` array: captured prefix blocks first, caller text after them. */
@@ -249,17 +358,32 @@ export function buildSystemBlocks(system: readonly string[] | undefined): readon
 
 /** Build the exact JSON body one turn sends. Exported for the shape test. */
 export function buildZcodeHttpBody(request: ZcodeHttpRequest, auth: ZcodeHttpAuth): Record<string, unknown> {
+  // Turns are normalised to block arrays on the wire, text-only ones included:
+  // the captured turn sent `content: [{type:'text',...}]`, and the internal
+  // string shorthand is a storage detail this boundary erases.
   const messages = mergeHttpMessages(request.messages).map(message => ({
     role: message.role,
-    content: [{ type: 'text', text: message.content }],
+    content: wireBlocks(message.content),
   }))
   if (messages.length === 0) {
     throw new ZcodeError('UNSUPPORTED_CONTENT', 'channel=http needs at least one message; the request would be empty')
   }
+  // Declarations go out only when the caller has tools and the policy allows
+  // them. An empty array is deliberately not sent: the captured text-only turn
+  // carried no `tools` key, and the endpoint is not required to accept both.
+  const tools =
+    request.tools === undefined || request.tools.length === 0
+      ? undefined
+      : request.tools.map(tool => ({
+          name: tool.name,
+          description: tool.description,
+          input_schema: tool.inputSchema,
+        }))
   const body: Record<string, unknown> = {
     model: request.model,
     max_tokens: request.maxTokens ?? ZCODE_HTTP_DEFAULT_MAX_TOKENS,
     system: buildSystemBlocks(request.system),
+    ...(tools === undefined ? {} : { tools }),
     messages,
     thinking: { type: 'enabled' },
     output_config: { effort: request.effort ?? DEFAULT_EFFORT },
@@ -466,12 +590,32 @@ function usageOf(raw: unknown, previous: ZcodeHttpUsage | undefined): ZcodeHttpU
   return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens }
 }
 
+/** A non-empty `input` object as partial JSON, or `undefined` when there is none. */
+function partialInputOf(input: unknown): string | undefined {
+  const record = asRecord(input)
+  if (record === undefined) return undefined
+  return Object.keys(record).length === 0 ? undefined : JSON.stringify(record)
+}
+
 /** Content blocks of a non-streaming (JSON) answer, in the same shape. */
 function* jsonAnswerEvents(payload: Record<string, unknown>): Generator<ZcodeHttpEvent> {
   const blocks = Array.isArray(payload['content']) ? payload['content'] : []
-  for (const raw of blocks) {
+  for (const [index, raw] of blocks.entries()) {
     const block = asRecord(raw)
     if (block === undefined) continue
+    if (block['type'] === 'tool_use') {
+      const id = typeof block['id'] === 'string' ? block['id'] : ''
+      const name = typeof block['name'] === 'string' ? block['name'] : ''
+      if (id.length === 0 || name.length === 0) {
+        throw new ZcodeError('ZCODE_PARSE', 'The endpoint returned a tool_use block without an id or a name')
+      }
+      const out: ZcodeHttpEvent[] = [{ type: 'tool-use-start', index, id, name }]
+      const partial = partialInputOf(block['input'])
+      if (partial !== undefined) out.push({ type: 'tool-use-delta', index, partialJson: partial })
+      out.push({ type: 'block-stop', index })
+      yield* out
+      continue
+    }
     const text = block['text']
     if (typeof text !== 'string' || text.length === 0) continue
     yield block['type'] === 'thinking' ? { type: 'thinking', text } : { type: 'text', text }
@@ -489,9 +633,25 @@ function* jsonAnswerEvents(payload: Record<string, unknown>): Generator<ZcodeHtt
  * in-stream `error` object is classified exactly like a non-2xx response,
  * because the endpoint reports mid-turn failures that way with HTTP 200.
  */
+/**
+ * What the mapping table remembers between frames.
+ *
+ * `opened` exists because `content_block_stop` is raised for every block the
+ * endpoint sends, including ones this adapter never opened for (a text block
+ * that carried no text, or a frame arriving after a truncated stream). Closing
+ * a block that was never started would hand DSH an end for a block it has no
+ * start for, so the table tracks the open indices itself.
+ */
+export interface ZcodeSseState {
+  usage: ZcodeHttpUsage | undefined
+  sawStop: boolean
+  /** Indices opened by a start frame and not yet stopped, in start order. */
+  opened?: number[]
+}
+
 export function mapZcodeSsePayload(
   payload: Record<string, unknown>,
-  state: { usage: ZcodeHttpUsage | undefined; sawStop: boolean },
+  state: ZcodeSseState,
 ): ZcodeHttpEvent[] {
   const type = typeof payload['type'] === 'string' ? payload['type'] : undefined
   switch (type) {
@@ -511,6 +671,24 @@ export function mapZcodeSsePayload(
     }
     case 'content_block_start': {
       const block = asRecord(payload['content_block'])
+      const index = numberOf(payload['index']) ?? 0
+      // Registered before the branch: a start frame opens the block even when
+      // it carries no content, and its matching stop must still be closable.
+      const opened = state.opened ?? (state.opened = [])
+      if (!opened.includes(index)) opened.push(index)
+      if (block?.['type'] === 'tool_use') {
+        const id = typeof block['id'] === 'string' ? block['id'] : ''
+        const name = typeof block['name'] === 'string' ? block['name'] : ''
+        if (id.length === 0 || name.length === 0) {
+          throw new ZcodeError('ZCODE_PARSE', 'The endpoint opened a tool_use block without an id or a name')
+        }
+        const out: ZcodeHttpEvent[] = [{ type: 'tool-use-start', index, id, name }]
+        // A non-streaming-shaped deployment may hand the whole input here and
+        // send no deltas at all; carry it as the first (and only) delta.
+        const partial = partialInputOf(block['input'])
+        if (partial !== undefined) out.push({ type: 'tool-use-delta', index, partialJson: partial })
+        return out
+      }
       const text = typeof block?.['text'] === 'string' ? (block['text'] as string) : ''
       if (text.length === 0) return []
       return block?.['type'] === 'thinking' ? [{ type: 'thinking', text }] : [{ type: 'text', text }]
@@ -518,12 +696,26 @@ export function mapZcodeSsePayload(
     case 'content_block_delta': {
       const delta = asRecord(payload['delta'])
       if (delta === undefined) return []
+      const index = numberOf(payload['index']) ?? 0
       const text = typeof delta['text'] === 'string' ? delta['text'] : ''
       const thinking = typeof delta['thinking'] === 'string' ? delta['thinking'] : ''
+      const partialJson = typeof delta['partial_json'] === 'string' ? delta['partial_json'] : ''
       const out: ZcodeHttpEvent[] = []
       if (thinking.length > 0) out.push({ type: 'thinking', text: thinking })
       if (text.length > 0) out.push({ type: 'text', text })
+      if (partialJson.length > 0) out.push({ type: 'tool-use-delta', index, partialJson })
       return out
+    }
+    case 'content_block_stop': {
+      // Raised for every block, text ones included. Only an index this table
+      // opened is closed: a stop for a block that never started (an empty text
+      // block, a frame after truncation) would end a block DSH never began.
+      const index = numberOf(payload['index']) ?? 0
+      const opened = state.opened
+      const at = opened === undefined ? -1 : opened.indexOf(index)
+      if (opened === undefined || at < 0) return []
+      opened.splice(at, 1)
+      return [{ type: 'block-stop', index }]
     }
     case 'message_delta': {
       const out: ZcodeHttpEvent[] = []
@@ -545,8 +737,8 @@ export function mapZcodeSsePayload(
       return [{ type: 'stop', reason: state.usage === undefined ? undefined : 'end_turn' }]
     }
     default:
-      // `ping`, `content_block_stop`, and any future frame this adapter has no
-      // behaviour for. Ignoring is safe because termination is checked below.
+      // `ping`, and any future frame this adapter has no behaviour for.
+      // Ignoring is safe because termination is checked below.
       return []
   }
 }
@@ -631,7 +823,7 @@ export async function* streamZcodeHttp(request: ZcodeHttpRequest): AsyncGenerato
       throw new ZcodeError('ZCODE_PARSE', 'The Messages endpoint answered without a body')
     }
 
-    const state: { usage: ZcodeHttpUsage | undefined; sawStop: boolean } = { usage: undefined, sawStop: false }
+    const state: ZcodeSseState = { usage: undefined, sawStop: false, opened: [] }
     for await (const frame of parseZcodeSse(response.body)) {
       if (frame.data === '[DONE]') {
         state.sawStop = true

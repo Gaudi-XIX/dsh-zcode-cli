@@ -54,6 +54,22 @@
  * version deliberately does not emit; advertising it as working would be a
  * silent downgrade of the tool surface.
  *
+ * ### The same policy over HTTP
+ *
+ * The table above describes the CLI route, where a tool call has no executor.
+ * The HTTP route is the transport for a loop DSH runs, so the three policies
+ * mean different things there:
+ *
+ * | policy | HTTP route |
+ * | --- | --- |
+ * | `reject` | no schemas sent; a request carrying tools fails closed with `UNSUPPORTED_TOOLS` |
+ * | `zcode-owned` | no schemas sent; a `tool_use` frame fails closed at projection, because no DSH tool was offered |
+ * | `dsh-owned` | schemas sent as `tools[]`; `tool_use` frames are projected as `tool-call` blocks and the turn finishes `tool-calls` |
+ *
+ * `dsh-owned` is therefore implemented on one channel and refused on the other,
+ * which is honest: the CLI has no way to hand a call back, and pretending
+ * otherwise would either drop the call or run the tool twice.
+ *
  * `temperature`, `maxTokens` and `stop` have no channel in ZCode 0.17.0, so
  * accepting them and dropping them silently would let a caller believe a
  * sampling setting took effect. They are refused under every policy, before the
@@ -103,6 +119,7 @@ import {
   EMPTY_RESPONSE_CODE,
   LlmAdapter,
   LlmError,
+  ToolCallId,
   resolveRetryPolicy,
 } from '@deepseek-ai/dsh-llm'
 import type {
@@ -118,6 +135,7 @@ import type {
   ResolvedRetryPolicy,
   StreamChunk,
   TokenUsage,
+  ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 
 import {
@@ -146,7 +164,9 @@ import { ZcodeStreamParser, parseStdout, type ZcodeFrame, type ZcodeTokenUsage }
 import {
   mergeHttpMessages,
   streamZcodeHttp,
+  type ZcodeHttpContentBlock,
   type ZcodeHttpMessage,
+  type ZcodeHttpTool,
   type ZcodeHttpUsage,
 } from '../zcode/http-channel.js'
 
@@ -349,7 +369,7 @@ export class ZcodeAdapter extends LlmAdapter {
     // configured `model` is merged in even when `models` omits it, so a profile
     // that sets only `model` never fails `resolveModel` with MODEL_NOT_FOUND.
     this.catalog = configuredModels({ model: config.model, models: config.models ?? DEFAULT_MODELS })
-    this.toolPolicy = config.toolPolicy ?? 'reject'
+    this.toolPolicy = config.toolPolicy ?? 'dsh-owned'
     const channel = config.channel ?? DEFAULT_CHANNEL
     // `cli` keeps the spawned-process path; the two credential channels speak the
     // Messages protocol directly and never start a child.
@@ -527,8 +547,25 @@ export class ZcodeAdapter extends LlmAdapter {
     let failure: LlmFailure | undefined
     let usage: TokenUsage | undefined
     let stopReason: string | undefined
-    let textOpen = false
-    const textParts: string[] = []
+    const answerText: string[] = []
+    const toolCalls: { id: string; name: string; arguments: string }[] = []
+
+    // Declaring tools and projecting calls are one decision, not two: a policy
+    // that never sends a schema cannot honour a call, and one that sends them
+    // must be able to hand the call to DSH.
+    const projectTools = this.toolPolicy === 'dsh-owned'
+    let nextIndex = 0
+    let textBlock: { index: number; parts: string[] } | undefined
+    // Keyed by the wire block index. A response can open a thinking block, a
+    // text block and one or more tool_use blocks, and only the SSE index ties
+    // their deltas together; arrival order would fuse two concurrent calls.
+    const openTools = new Map<number, { index: number; id: string; name: string; parts: string[] }>()
+
+    const closeText = (block: { index: number; parts: string[] }): StreamChunk => ({
+      type: 'block-end',
+      index: block.index,
+      block: { type: 'text', text: block.parts.join('') },
+    })
 
     const admission = this.httpAdmissionFailure(options)
     if (admission !== undefined) {
@@ -536,6 +573,7 @@ export class ZcodeAdapter extends LlmAdapter {
     } else {
       try {
         const messages = toHttpMessages(options.messages)
+        const tools = projectTools ? toHttpTools(options.tools) : undefined
         for await (const event of streamZcodeHttp({
           channel,
           model,
@@ -544,6 +582,7 @@ export class ZcodeAdapter extends LlmAdapter {
           ...(messages.length === 0 || options.system === undefined || options.system.trim().length === 0
             ? {}
             : { system: [options.system] }),
+          ...(tools === undefined ? {} : { tools }),
           ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
           ...(options.temperature === undefined ? {} : { temperature: options.temperature }),
           ...(options.stop === undefined || options.stop.length === 0 ? {} : { stop: options.stop }),
@@ -552,12 +591,79 @@ export class ZcodeAdapter extends LlmAdapter {
         })) {
           switch (event.type) {
             case 'text': {
-              if (!textOpen) {
-                textOpen = true
-                yield { type: 'block-start', index: 0, blockType: 'text' }
+              if (textBlock === undefined) {
+                textBlock = { index: nextIndex++, parts: [] }
+                yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
               }
-              textParts.push(event.text)
-              yield { type: 'text-delta', index: 0, text: event.text }
+              textBlock.parts.push(event.text)
+              answerText.push(event.text)
+              yield { type: 'text-delta', index: textBlock.index, text: event.text }
+              break
+            }
+            case 'tool-use-start': {
+              if (!projectTools) {
+                // The endpoint answered with a call nobody asked for and nobody
+                // will run. Failing the turn is the only honest projection.
+                failure ??= {
+                  code: 'UNSUPPORTED_TOOLS',
+                  message: `The Messages endpoint returned a tool_use block ("${event.name}") under toolPolicy `
+                    + `"${this.toolPolicy}", which sends no tool schemas: no executor on this side owns it. `
+                    + 'Use "dsh-owned" to project tool calls.',
+                }
+                break
+              }
+              // A call starts its own block; the text block before it must be
+              // closed first, or two blocks would share an index.
+              if (textBlock !== undefined) {
+                yield closeText(textBlock)
+                textBlock = undefined
+              }
+              const open = { index: nextIndex++, id: event.id, name: event.name, parts: [] }
+              openTools.set(event.index, open)
+              yield { type: 'block-start', index: open.index, blockType: 'tool-call' }
+              break
+            }
+            case 'tool-use-delta': {
+              const open = openTools.get(event.index)
+              if (open === undefined) {
+                failure ??= {
+                  code: 'ZCODE_PARSE',
+                  message: `The stream sent arguments for tool block ${event.index}, which never opened.`,
+                }
+                break
+              }
+              open.parts.push(event.partialJson)
+              yield {
+                type: 'tool-call-delta',
+                index: open.index,
+                id: ToolCallId(open.id),
+                name: open.name,
+                argumentsDelta: event.partialJson,
+              }
+              break
+            }
+            case 'block-stop': {
+              const open = openTools.get(event.index)
+              if (open === undefined) break // A text block's stop; nothing to close here.
+              openTools.delete(event.index)
+              const args = open.parts.join('') || '{}'
+              // DSH hands this string to a tool executor, so a malformed one
+              // must fail the turn rather than surface as a runtime error later.
+              try {
+                JSON.parse(args)
+              } catch {
+                failure ??= {
+                  code: 'ZCODE_PARSE',
+                  message: `Tool "${open.name}" closed with arguments that are not valid JSON: `
+                    + `${args.length <= 200 ? args : `${args.slice(0, 199)}…`}`,
+                }
+              }
+              toolCalls.push({ id: open.id, name: open.name, arguments: args })
+              yield {
+                type: 'block-end',
+                index: open.index,
+                block: { type: 'tool-call', id: ToolCallId(open.id), name: open.name, arguments: args },
+              }
               break
             }
             case 'usage': {
@@ -581,20 +687,35 @@ export class ZcodeAdapter extends LlmAdapter {
       }
     }
 
-    if (textOpen) {
-      yield { type: 'block-end', index: 0, block: { type: 'text', text: textParts.join('') } }
+    if (textBlock !== undefined) {
+      yield closeText(textBlock)
+      textBlock = undefined
+    }
+    // A stream cut off before `content_block_stop` still has to leave DSH with
+    // balanced blocks; the arguments are whatever arrived before the cut.
+    for (const open of [...openTools.values()]) {
+      openTools.delete(open.index)
+      const args = open.parts.join('') || '{}'
+      toolCalls.push({ id: open.id, name: open.name, arguments: args })
+      yield {
+        type: 'block-end',
+        index: open.index,
+        block: { type: 'tool-call', id: ToolCallId(open.id), name: open.name, arguments: args },
+      }
     }
 
     if (failure === undefined) {
-      if (textParts.join('').trim().length === 0) {
+      if (toolCalls.length > 0) {
+        // A tool turn legitimately carries no prose; the calls are the answer.
+      } else if (answerText.join('').trim().length === 0) {
         // Same rule as the CLI path: an empty answer is a failure, never a quiet
         // success the loop would treat as a completed turn.
         failure = { code: EMPTY_RESPONSE_CODE, message: 'ZCode returned no answer text over the Messages endpoint' }
       } else if (isToolStopReason(stopReason)) {
         failure = {
           code: 'UNSUPPORTED_TOOLS',
-          message: `ZCode stopped with "${String(stopReason)}", which this route cannot project: `
-            + 'tool execution is not part of the v1 tool policy.',
+          message: `ZCode stopped with "${String(stopReason)}" but emitted no complete tool_use block, so this turn `
+            + 'cannot be projected as a tool call.',
         }
       }
     }
@@ -607,7 +728,8 @@ export class ZcodeAdapter extends LlmAdapter {
       toolPolicy: this.toolPolicy,
       purpose: options.purpose,
       durationMs: Date.now() - startedAt,
-      characters: textParts.join('').length,
+      characters: answerText.join('').length,
+      toolCalls: toolCalls.length,
       stopReason,
       code: failure?.code,
       toolSchemas: options.tools?.length ?? 0,
@@ -617,39 +739,37 @@ export class ZcodeAdapter extends LlmAdapter {
     if (usage !== undefined) yield { type: 'usage', usage }
     yield {
       type: 'finish',
-      reason: failure === undefined ? stopFinishReason(stopReason) : { kind: 'error', failure },
+      reason: failure !== undefined
+        ? { kind: 'error', failure }
+        : toolCalls.length > 0
+          ? { kind: 'tool-calls' }
+          : stopFinishReason(stopReason),
     }
   }
 
   /**
    * What this transport refuses before opening a socket.
    *
-   * The tool rule is the CLI rule: `reject` and `dsh-owned` promise a tool
-   * surface this route cannot deliver, so a request carrying schemas fails
-   * instead of silently running without them. `zcode-owned` proceeds with no
-   * schemas sent — whether the service runs its own tools behind the Messages
-   * endpoint is unverified, and the captured request carried no `tools` key
-   * either, so nothing here may claim more than that.
+   * The tool rule differs from the CLI path on purpose. On the CLI path there is
+   * no executor for a tool call, so every policy but `zcode-owned` has to refuse
+   * the schemas. Over HTTP this adapter *is* the transport for a tool loop DSH
+   * runs: `dsh-owned` declares the schemas and projects the calls back, and
+   * `zcode-owned` declares nothing (the endpoint runs no DSH tool), so a call
+   * that arrives anyway fails closed at projection time. Only `reject`, the
+   * explicit "no tools on this route" switch, refuses the request up front.
    *
    * `temperature`, `maxTokens` and `stop` are absent from this list on purpose:
    * the body has fields for them.
    */
   private httpAdmissionFailure(options: GenerateOptions): LlmFailure | undefined {
     const toolCount = options.tools?.length ?? 0
-    if (toolCount > 0 && this.toolPolicy !== 'zcode-owned') {
-      return this.toolPolicy === 'dsh-owned'
-        ? {
-            code: 'UNSUPPORTED_TOOLS',
-            message: `toolPolicy "dsh-owned" is not implemented: this version does not project tool-use blocks from the `
-              + `Messages endpoint back to DSH, so ${toolCount} declared tool(s) cannot be honored. `
-              + 'Use "zcode-owned" (schemas dropped) or "reject" (no tools).',
-          }
-        : {
-            code: 'UNSUPPORTED_TOOLS',
-            message: `toolPolicy "reject" refuses ${toolCount} declared tool schema(s) before the request opens: `
-              + 'this route cannot project tool calls back to DSH, and advertising them anyway would spend a '
-              + 'turn on tools nobody can run. Use "zcode-owned" or remove the tools from the request.',
-          }
+    if (toolCount > 0 && this.toolPolicy === 'reject') {
+      return {
+        code: 'UNSUPPORTED_TOOLS',
+        message: `toolPolicy "reject" refuses ${toolCount} declared tool schema(s) before the request opens: `
+          + 'this policy means no tools on this route. Use "dsh-owned" to declare them and project the calls, '
+          + 'or "zcode-owned" to send the turn without them.',
+      }
     }
     if (this.toolPolicy === 'reject') {
       const media = countMediaBlocks(options.messages)
@@ -984,12 +1104,16 @@ export class ZcodeAdapter extends LlmAdapter {
     }
     const toolCount = options.tools?.length ?? 0
     if (toolCount > 0 && this.toolPolicy !== 'zcode-owned') {
+      // `dsh-owned` is implemented over HTTP (`streamOverHttp` projects
+      // `tool_use` frames as `tool-call` blocks). The CLI route has no channel
+      // back to DSH for a call: zcode.cjs prints tool progress as terminal text
+      // and exits, so the schemas go nowhere. Refusing is the only honest answer.
       return this.toolPolicy === 'dsh-owned'
         ? {
             code: 'UNSUPPORTED_TOOLS',
-            message: `toolPolicy "dsh-owned" is not implemented: this version does not emit tool-call frames, `
-              + `so ${toolCount} declared tool(s) cannot be projected back to DSH. `
-              + 'Use "zcode-owned" (ZCode runs its own tools) or "reject" (no tools).',
+            message: `toolPolicy "dsh-owned" is not implemented on channel "cli": this transport cannot emit tool-call `
+              + `frames, so ${toolCount} declared tool(s) cannot be projected back to DSH. `
+              + 'Use "zcode-owned" (ZCode runs its own tools), "reject" (no tools), or channel "free"/"paid".',
           }
         : {
             code: 'UNSUPPORTED_TOOLS',
@@ -1264,11 +1388,20 @@ function renderContent(content: readonly ContentBlock[]): string {
 /**
  * Project the DSH transcript onto the `messages` array of a Messages request.
  *
- * Roles survive where the endpoint has one: `assistant` stays `assistant`,
- * everything else (user, system, developer, tool) becomes `user`. A message that
- * was not plain user speech keeps the same heading the CLI path prints, because
- * an unlabelled system instruction or tool result read as user speech asks a
- * different question than the one DSH recorded.
+ * Roles survive where the endpoint has one: `assistant` stays `assistant` and a
+ * `tool` turn becomes a `user` turn carrying one `tool_result` block, which is
+ * how the Messages protocol answers a `tool_use`. Every other role (user,
+ * system, developer) becomes `user`; a message that was not plain user speech
+ * keeps the same heading the CLI path prints, because an unlabelled system
+ * instruction read as user speech asks a different question than the one DSH
+ * recorded.
+ *
+ * Assistant turns are projected block by block so a `tool-call` goes back out as
+ * `tool_use` with the same id it was issued under — the endpoint pairs the
+ * following `tool_result` by that id, and a text-only restatement would lose the
+ * pairing. Reasoning blocks are dropped: the protocol accepts a thinking block
+ * only together with the signature that produced it, which this route does not
+ * store, and replaying the text as prose would put words in the model's mouth.
  *
  * A transcript that would open with an assistant turn fails closed instead of
  * being rewritten into user speech: nothing here may invent a role the history
@@ -1277,13 +1410,32 @@ function renderContent(content: readonly ContentBlock[]): string {
 export function toHttpMessages(messages: readonly RequestMessage[]): readonly ZcodeHttpMessage[] {
   const projected: ZcodeHttpMessage[] = []
   for (const message of messages) {
+    if (message.role === 'tool') {
+      const text = renderContent(message.content).trim()
+      projected.push({
+        role: 'user',
+        content: [
+          {
+            type: 'tool-result',
+            toolUseId: String(message.toolCallId),
+            // The protocol rejects an empty result body; say "nothing" explicitly
+            // rather than sending a block the endpoint may read as malformed.
+            content: text.length === 0 ? '(no output)' : text,
+            ...(message.isError === true ? { isError: true } : {}),
+          },
+        ],
+      })
+      continue
+    }
+    if (message.role === 'assistant') {
+      const blocks = assistantContentBlocks(message.content)
+      if (blocks.length > 0) projected.push({ role: 'assistant', content: blocks })
+      continue
+    }
     const body = renderContent(message.content).trim()
     if (body.length === 0) continue
-    const role = message.role === 'assistant' ? 'assistant' : 'user'
-    const content = message.role === 'user' || message.role === 'assistant'
-      ? body
-      : `${roleHeading(message)}:\n${body}`
-    projected.push({ role, content })
+    const content = message.role === 'user' ? body : `${roleHeading(message)}:\n${body}`
+    projected.push({ role: 'user', content })
   }
   const merged = mergeHttpMessages(projected)
   if (merged[0]?.role === 'assistant') {
@@ -1294,6 +1446,76 @@ export function toHttpMessages(messages: readonly RequestMessage[]): readonly Zc
     )
   }
   return merged
+}
+
+/** One assistant turn as wire blocks: text as prose, `tool-call` as `tool_use`. */
+function assistantContentBlocks(content: readonly ContentBlock[]): readonly ZcodeHttpContentBlock[] {
+  const blocks: ZcodeHttpContentBlock[] = []
+  for (const block of content) {
+    switch (block.type) {
+      case 'text': {
+        if (block.text.length > 0) blocks.push({ type: 'text', text: block.text })
+        break
+      }
+      case 'tool-call': {
+        blocks.push({ type: 'tool-use', id: String(block.id), name: block.name, input: toolCallInput(block.name, block.arguments) })
+        break
+      }
+      default: {
+        // reasoning / image / file / tool-addition / tool-removal: none of them
+        // has a place in an assistant turn the endpoint will accept.
+        break
+      }
+    }
+  }
+  return blocks
+}
+
+/**
+ * Parse the stored raw JSON of one call into the `input` object the wire wants.
+ *
+ * A tool call the endpoint cannot parse as an object is a broken history, not a
+ * turn to guess at: sending `{}` instead would silently run a tool with no
+ * arguments, and wrapping the value would invent a schema nobody declared.
+ */
+function toolCallInput(name: string, raw: string | undefined): Record<string, unknown> {
+  // A no-argument tool call carries no `arguments` string at all; treat a
+  // missing value as the empty object instead of throwing a TypeError that
+  // would surface as an opaque ZCODE_UNKNOWN.
+  if (typeof raw !== 'string') return {}
+  const trimmed = raw.trim()
+  if (trimmed.length === 0) return {}
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    throw new ZcodeError(
+      'UNSUPPORTED_CONTENT',
+      `History carries a tool call "${name}" whose arguments are not JSON; the Messages endpoint needs an object.`,
+    )
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ZcodeError(
+      'UNSUPPORTED_CONTENT',
+      `History carries a tool call "${name}" whose arguments are not a JSON object.`,
+    )
+  }
+  return parsed as Record<string, unknown>
+}
+
+/**
+ * Project the declared tools onto the wire `tools[]` array.
+ *
+ * `undefined` when there is nothing to declare: an empty array is not the same
+ * request as an absent key, and the captured turn sent no `tools` at all.
+ */
+export function toHttpTools(tools: readonly ToolSchema[] | undefined): readonly ZcodeHttpTool[] | undefined {
+  if (tools === undefined || tools.length === 0) return undefined
+  return tools.map(tool => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.parameters,
+  }))
 }
 
 /**
