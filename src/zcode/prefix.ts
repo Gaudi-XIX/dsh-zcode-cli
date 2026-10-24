@@ -7,7 +7,7 @@
  * contract, and both of the latter are marked `cache_control: ephemeral` so the
  * upstream keeps them in its prompt cache across turns.
  *
- * Byte fidelity is the contract. The free channel accepted this exact prefix
+ * Byte fidelity is the contract. A real ZCode turn accepted this exact prefix
  * live, so anything that edits the text — reflowing, trimming, reordering,
  * dropping the cache markers — is a different request against an endpoint this
  * project has no other way to validate. {@link ZCODE_SYSTEM_PREFIX_CHARS}

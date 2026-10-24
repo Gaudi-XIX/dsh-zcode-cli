@@ -9,11 +9,13 @@ DSH 的 ZCode provider：把本机 `zcode.cjs`（ZCode 0.17.0）作为一个 `zc
 - 在**启动子进程之前**用稳定错误码拒绝它兑现不了的请求：`tools`（`reject` / `dsh-owned` 下）、`temperature` / `maxTokens` / 非空 `stop`、`reject` 下的 image/file block。
 - fail-closed 的宿主校验：四项 ZCode 路径变量、`NODE_OPTIONS` 值级白名单、会话 workspace 根（拿不到报 `WORKSPACE_UNAVAILABLE`，不退回 `process.cwd()`）。
 - 子进程环境是**闭集**：只有固定白名单 + 五项契约值 + `config.passEnv`，宿主其他变量不外泄。
-- 设置页卡片上方多两块只读面板：**额度**（每行剩余 / 总额、占比条、到期时间）与**套餐**（名称、状态、有效期、权益）。数据来自插件自己的 loopback 路由 `GET /plugins/zcode-provider/billing`（30 秒进程内缓存，`?refresh=1` 强制刷新），token 只在 Node 半边解密与使用。
+- 设置页卡片上方是运行配置块（套餐 / 模型 / 推理强度三个下拉），读写插件自己的 loopback 路由 `GET` / `POST /plugins/dsh-zcode-provider/state`；卡片不接触任何凭据文件。
 
-不做什么：不做模型发现（ZCode 没有免配额的模型列表）、不猜计费、不用额度读数拦截请求（面板只展示服务端看到的 plans / balances）、不伪造 sessionId。
+不做什么：不做模型发现（ZCode 没有免配额的模型列表）、不猜计费、不用任何读数拦截请求（1309 只作为历史观测记录）、不伪造 sessionId。
 
-浏览器半边：`client/` 往 `settings.models.provider-card` 槽注册一张卡片（`key` 逐字等于 `ZCODE_SETTINGS_NS`，否则设置页里本行是空白——槽位没有回退表单）。上半部分从上面那条路由取额度/套餐，下半部分是随包发布的默认值与环境契约；不读写宿主配置文件。构建物 `dist/client.js` 被 gitignore，由门禁现建。
+浏览器半边：`client/` 往 `settings.models.provider-card` 槽注册一张卡片（`key` 逐字等于 `ZCODE_SETTINGS_NS`，否则设置页里本行是空白——槽位没有回退表单）。上半部分是运行配置三个下拉，下半部分是随包发布的默认值与环境契约；不读写宿主配置文件。构建物 `dist/client.js` 被 gitignore，由门禁现建。
+
+传输只有一条路：**spawn 官方 `zcode.cjs`**。用户 2026-10-24 明确否掉 HTTP 直连（"我只走 C 的，不可能走 HTTP 的"）——只有官方二进制自带 ed25519 请求签名，第三方 HTTP 伪装请求头会被 `405 [3012]` 风控打回并带账号惩罚；进程委托也不持有、不解密任何凭据。卡片上的「套餐」下拉在 CLI 单通路下是标签，实际套餐由 ZCode 自己的 `setting.json` / `provider_config.json` 决定，插件只读不写。
 
 ## 安装
 
@@ -29,7 +31,7 @@ DSH 的 ZCode provider：把本机 `zcode.cjs`（ZCode 0.17.0）作为一个 `zc
 node scripts/run-tests.mjs    # AC11 行尾 → tsc --noEmit → build → tsc client → build:client → 包入口点 → 测试面计数 → node --test
 ```
 
-`tests/` 下 12 个 `*.test.mjs`；脚本里的显式清单、`docs/dsh-provider-contract.md` 的「测试面」计数与磁盘实点三者必须一致，否则门禁在跑测试前就停。用例总数同样锁死（221，`EXPECTED_TEST_CASES` 与文档「测试用例」行），删掉一个 `test()` 块也会让门禁变红。
+`tests/` 下 10 个 `*.test.mjs`；脚本里的显式清单、`docs/dsh-provider-contract.md` 的「测试面」计数与磁盘实点三者必须一致，否则门禁在跑测试前就停。用例总数同样锁死（139，`EXPECTED_TEST_CASES` 与文档「测试用例」行），删掉一个 `test()` 块也会让门禁变红。
 
 ## 已知限制（摘要）
 

@@ -200,7 +200,7 @@ test('registration has no boot-time side effects: no env read, no process, no fi
       [],
     )
     // 4. The only host surfaces touched are registration (`llm`, `logger`) and
-    //    the optional billing mount (`inject`), which is wrapped in try/catch:
+    //    the optional web route mount (`inject`), which is wrapped in try/catch:
     //    a host without a web server must still mount the adapter. A spawn or a
     //    file write would need another service and would show up here.
     assert.deepEqual([...new Set(calls.touched)].sort(), ['inject', 'llm', 'logger'])

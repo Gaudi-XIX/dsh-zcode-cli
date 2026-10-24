@@ -225,7 +225,7 @@ test('resolveModel refuses an unknown id and resolves every advertised one', asy
   )
   // Advertised but not the configured model: resolution still succeeds, because
   // the host builds the picker by resolving every listed model and one throw
-  // drops the whole provider from the catalog. The cli channel refuses such a
+  // drops the whole provider from the catalog. The CLI route refuses such a
   // model at the turn instead — covered by its own test below.
   const other = await instance.resolveModel('zcode', 'GLM-5.3')
   assert.equal(other.id, 'GLM-5.3')
@@ -238,7 +238,7 @@ test('resolveModel refuses an unknown id and resolves every advertised one', asy
   assert.deepEqual(resolved.inputModalities, ['text'])
 })
 
-test('the cli channel refuses a model it cannot run, at the turn', async () => {
+test('the CLI route refuses a model it cannot run, at the turn', async () => {
   const instance = adapter({}, { models: [{ id: 'GLM-5.3-Flash' }, { id: 'GLM-5.3' }] })
 
   const chunks = await collect(instance.stream(request('@@json@@', { model: 'GLM-5.3' })))

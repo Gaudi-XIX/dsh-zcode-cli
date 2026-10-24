@@ -66,23 +66,17 @@ class ZcodeAdapter extends LlmAdapter {
 `GenerateOptions` 是 DSH 已组装的无提供方请求：`provider`、`model`、`messages`、`system`、`tools`、`temperature`、`maxTokens`、`stop`、`reasoningEffort`、`signal`、`sessionId`、`purpose`。
 
 - `signal` 必须尊重：取消即终止子进程，映射为 `ABORTED`。
-- 不支持的字段不能静默丢弃，必须抛带稳定 code 的 `ZcodeError`。默认 `toolPolicy: dsh-owned` 下工具 schema 照常下发并投影回 DSH；`reject` 下非空 `tools` 报 `UNSUPPORTED_TOOLS`，image/file block 报 `UNSUPPORTED_CONTENT`——两条在 spawn 之前生效（`channel: cli`）或在开 socket 之前生效（`channel: free|paid`）。`temperature` / `maxTokens` / 非空 `stop` **只在 `channel: cli`** 报 `UNSUPPORTED_OPTION`：CLI 的 `-p` 协议没有这三个字段的入口；两个 HTTP 通道把它们原样放进请求体（见「传输通道」）。
-- `toolPolicy: dsh-owned`（默认）把 DSH 的工具 schema 下发，端点回的 `tool_use` 投影成 `block-start(tool-call) → tool-call-delta* → block-end(tool-call)` 并以 `finish{tool-calls}` 收尾；`zcode-owned` 丢弃 schema 后继续，但端点若仍回 `tool_use` 则 fail-closed；`reject` 直接拒绝带 tools 的回合。两种宽松策略下 image/file 投影为占位文本（`[图片附件 … 图片内容未发送]`），不静默丢失。
-- `reasoningEffort` 不映射到 CLI（`-p` 协议没有该通道）；HTTP 通道把它放进 `output_config.effort`，取值 `low|medium|high|max`，缺省 `high`。
+- 不支持的字段不能静默丢弃，必须抛带稳定 code 的 `ZcodeError`。默认 `toolPolicy: dsh-owned` 下工具 schema 照常下发并投影回 DSH；`reject` 下非空 `tools` 报 `UNSUPPORTED_TOOLS`，image/file block 报 `UNSUPPORTED_CONTENT`——两条都在 spawn 之前生效。`temperature` / `maxTokens` / 非空 `stop` 报 `UNSUPPORTED_OPTION`：CLI 的 `-p` 协议没有这三个字段的入口。
+- `toolPolicy: dsh-owned`（默认）把 DSH 的工具 schema 下发，stdout 里的 tool frame 投影成 `block-start(tool-call) → tool-call-delta* → block-end(tool-call)` 并以 `finish{tool-calls}` 收尾；`zcode-owned` 丢弃 schema 后继续，但 stdout 若仍回 tool frame 则 fail-closed；`reject` 直接拒绝带 tools 的回合。两种宽松策略下 image/file 投影为占位文本（`[图片附件 … 图片内容未发送]`），不静默丢失。
+- `reasoningEffort` 不映射到 CLI（`-p` 协议没有该通道）：卡片上选中的 effort 只写进 selection.json，不改变任何一次 spawn 的 argv。
 
-## 传输通道（channel）
+## 传输通路（唯一：CLI 委托）
 
-`config.channel` 三选一，缺省 `cli`；浏览器端卡片选择在下一次请求生效（`resolveTurnChannel()`），无法识别的值回落到注册时捕获的 `channel`，**不猜传输方式**——猜错会花掉一个用户没选的凭据。
+**只有一条通路：spawn 官方 `zcode.cjs`。** 这是用户 2026-10-24 定的口径（"HTTP 肯定不能用……我只走 C 的，不可能走 HTTP 的"），理由有三层：① 只有官方二进制自己带 ed25519 客户端请求签名，第三方 HTTP 无论伪装多少请求头都过不了 Coding Plan 档的签名校验；② 免费 Start Plan 端点对无签名请求会回 `405 [3012] request has been blocked due to unusual activity`，且带账号惩罚阶梯（30 分钟 → 24 小时 → 停用）；③ 进程委托不持有、不解密任何凭据——与 `dsh-agy-provider` 同一条合规底线。
 
-| 通道 | 传输 | 凭据来源 | 端点 |
-|---|---|---|---|
-| `cli` | spawn `zcode.cjs -p … --mode guarded --json` | 由 CLI 自己管 | 本机进程 |
-| `free` | HTTP，Anthropic Messages 形状的流式 SSE | ZCode CLI 登录态：`<ZCODE_DATA_BASE_DIR>/.zcode/v2/credentials.json` 的 `zcodejwttoken`（`enc:v1:` AES-256-GCM，12 字节 IV + 16 字节 tag，密钥 = `sha256(ZCODE_CREDENTIAL_SECRET)`，变量缺省时用本机回落串）+ `telemetry-state.json` 的 `deviceMid`（`x-device-mid`） | `https://zcode.z.ai/api/v1/zcode-plan/anthropic` + `/v1/messages` |
-| `paid` | 同上 | 只从环境读 `ZCODE_PAID_API_KEY`；**不读配置文件**，`config.apiKey` 不接受 | `config.paidBaseUrl`（缺省 `https://open.bigmodel.cn/api/anthropic`）+ `/v1/messages` |
+因此 `config.channel` 这个概念**已整体删除**（含 `free` / `paid` 两个 HTTP 通道、`src/zcode/http-channel.ts`、`src/zcode/billing.ts`、`ZCODE_HTTP` 一族错误码、`/plugins/zcode-provider/billing` 路由）。HTTP 直连在 2026-10-24 14:50 曾跑通过两轮工具闭环，随后被 3012 风控永久标记，不再作为任何路径保留。
 
-请求体的字段是本机抓包（`F:\AgentData\.agents\flow\tmp\zc-capture.json`，123 KB，一次真实 free 通道请求的完整请求体与 SSE 响应）逐字段对出来的：`model`、`max_tokens`（缺省 `128000`）、`system`（prefix 块 + 调用方 system）、`messages`（`user`/`assistant` 两角色，system/工具等非对话轮折进 `user` 并在正文前加角色标题）、`thinking: {type: 'enabled'}`、`output_config.effort`、`stream: true`；`temperature` 与 `stop_sequences` 只在调用方设置时才出现。`free` 通道额外带 `metadata.user_id`（`device_id` = `deviceMid`、`session_id` = 会话 id），`paid` 通道不带——它没有设备与会话绑定，发一个空 `device_id` 等于声明一件本适配器无法背书的事。
-
-失败映射：非 2xx 按状态码与响应体分派到 `ZCODE_HTTP` 一族（`ZCODE_CREDENTIAL_*`、`ZCODE_BILLING_*` 由各自的模块产出），SSE 里的 tool 停止原因按 `toolPolicy` 判 `UNSUPPORTED_TOOLS`；HTTP 通道的默认墙钟上限 `900000` ms（`ZCODE_HTTP_DEFAULT_TIMEOUT_MS`），失败诊断里回显的响应体截到 `512` 字符（`ZCODE_HTTP_BODY_SNIPPET_MAX_CHARS`）。
+浏览器端卡片上的「套餐」下拉（`free` / `paid`）**不是传输选择，是标签**：两条都 spawn 同一条命令，实际走哪个套餐由 ZCode 自己的状态文件决定——`<ZCODE_DATA_BASE_DIR>/.zcode/v2/setting.json` 的 `providerFamilyConnectionSelections.<family>.kind`（`start-plan` / `individual-coding-plan` / `team-coding-plan`）与同目录 `provider_config.json` 的 `defaultModelSelection`。插件**只读**这两个文件（`src/zcode/profile.ts`），从不写：那是另一个应用的状态，且 `provider_config.json` 里带着它的 API key。
 
 ## StreamChunk 顺序
 
@@ -150,7 +144,7 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 
 ## 错误码表
 
-`ZCODE_ERROR_CODES` 共 **25** 个（原 17 个 + 额度面板 7 个 + HTTP 直连 1 个 `ZCODE_HTTP`：`ZCODE_CREDENTIAL_MISSING`、`ZCODE_CREDENTIAL_INVALID`、`ZCODE_CREDENTIAL_DECRYPT_FAILED`、`ZCODE_BILLING_UNAUTHORIZED`、`ZCODE_BILLING_BAD_REQUEST`、`ZCODE_BILLING_HTTP`、`ZCODE_BILLING_PARSE`）；stderr 那一半错误只从 stderr 文本解析（`classifyStderr()`），provider 数字码保留在 `ZcodeError.providerCode`；额度那 7 个只由 `src/zcode/billing.ts` 的产生，不经过 stderr。
+`ZCODE_ERROR_CODES` 共 **17** 个。stderr 那一半错误只从 stderr 文本解析（`classifyStderr()`），provider 数字码保留在 `ZcodeError.providerCode`；`ZCODE_CREDENTIAL_*` / `ZCODE_BILLING_*` / `ZCODE_HTTP` 一族随 HTTP 直连通道整体删除（2026-10-24），本表已无任何非 CLI 来源的错误码。
 
 | code | 含义 | 可重试 |
 |---|---|---|
@@ -170,13 +164,6 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 | `ZCODE_BUSY` | 并发队列已满（`maxQueue`） | 否 —— 拥塞不是进程故障，不重试也不丢 session |
 | `ZCODE_OUTPUT_TOO_LARGE` | 单行或总量超过 `maxEventLineLength` / `maxOutputBytes` | 否 —— 重试只会再超限 |
 | `WORKSPACE_UNAVAILABLE` | 解析不到会话 workspace 根 | 否 —— 需宿主侧修数据 |
-| `ZCODE_CREDENTIAL_MISSING` | `ZCODE_DATA_BASE_DIR` 下没有 `.zcode/v2/credentials.json`（或 `telemetry-state.json` 里没有 `deviceMid`） | 否 —— 先用 ZCode CLI 登录 |
-| `ZCODE_CREDENTIAL_INVALID` | 凭据文件 / telemetry 状态不是合法 JSON，或 `zcodejwttoken` 字段缺失、不是字符串 | 否 —— 文件损坏，重新登录 |
-| `ZCODE_CREDENTIAL_DECRYPT_FAILED` | `enc:v1:` 载荷解不开：GCM 校验失败、base64url 形状不对、密钥与登录时不一致 | 否 —— 检查 `ZCODE_CREDENTIAL_SECRET` / 是否换了 OS 账号 |
-| `ZCODE_BILLING_UNAUTHORIZED` | 计费接口返回 401 / 403 | 否 —— 凭据过期或被拒，重新登录 |
-| `ZCODE_BILLING_BAD_REQUEST` | 计费接口返回 400，或 HTTP 200 但业务码 `3001`（缺 `X-Device-Mid`） | 否 —— 设备标识缺失或不被接受 |
-| `ZCODE_BILLING_HTTP` | 其他非 2xx（429 / 5xx 等），以及业务码非 0、非 3001 | 是 —— 服务端或网络临时状态 |
-| `ZCODE_BILLING_PARSE` | 响应不是 JSON，或 `data.plans` / `data.balances` 不是数组 | 否 —— 契约变了，先看服务端 |
 
 `ZCODE_BUSY` 与 `ZCODE_OUTPUT_TOO_LARGE` 刻意**不在**重试白名单、也**不在** `DROPS_SESSION_ON`：前者是排队拥塞，重试只会放大；后者说明输出契约被违反，换一次 spawn 也还是超限。两者也不丢 session id——session 没坏，坏的是这一次调用的形态。
 
@@ -247,38 +234,28 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 2. 环境变量可保留：它们只是 ZCode CLI 需要的宿主配置，删掉会让 ZCode 本体也起不来；确需删除时按 `install-env.ps1` 输出的键名逐个 `[Environment]::SetEnvironmentVariable(name, $null, 'User')`。
 3. 重启 DSH。
 
-## 额度 / 套餐面板（billing）
-
-设置页卡片上方的「额度」「套餐」两块由插件自己的 loopback 路由供数，浏览器半边**看不到** token：解密与请求都在 Node 半边完成，卡片只拿已经归一化的 JSON。这条路径只读，不改任何 ZCode 状态。
-
-- 路由：`GET /plugins/zcode-provider/billing`（`BILLING_ROUTE_PATH`，`src/web/router.ts`）。`src/index.ts` 在 `enabled` 判断**之前**用 `try/catch` 调 `setupBillingRoutes(ctx)`：宿主没有 `webServer` 服务时回调不会执行，挂载失败只损失面板，不影响 provider 行注册与插件加载。
-- 响应：`{ ok: true, data }` 或 `{ ok: false, error: { code, message } }`，一律 `Content-Type: application/json`、`Cache-Control: no-store`。只接受 `GET`，非 `GET` 回 405、非 loopback 对端回 403（与 agy 同类路由同口径）。
-- 缓存：进程内 30 秒（`ZCODE_BILLING_CACHE_TTL_MS`），只缓存成功结果；缓存键是「上一次成功读取」。`?refresh=1` 跳过缓存并替换缓存内容。并发请求共享同一次在飞的读取（single-flight），失败不写缓存。
-- 取数：`fetchBillingSnapshot(env, { fetch, now })`（`src/zcode/billing.ts`）→ `GET https://zcode.z.ai/api/v1/zcode-plan/billing/balance`，头 `Authorization: Bearer <jwt>`、`X-Device-Mid: <deviceMid>`、`Accept: application/json`、`User-Agent: ZCode/3.4.0`。
-- 凭据：`<ZCODE_DATA_BASE_DIR>/.zcode/v2/credentials.json` 的 `zcodejwttoken` 形如 `enc:v1:<iv>.<tag>.<ciphertext>`（base64url 无 padding，16 字节 IV、16 字节 GCM tag），AES-256-GCM、AAD 为空。密钥 = `sha256(secret)`，`secret = ZCODE_CREDENTIAL_SECRET`，否则 `zcode-credential-fallback:${process.platform}:${os.homedir()}:${USERNAME}`。`deviceMid` 取同目录 `telemetry-state.json`。jwt、密文与解密中间值**不进**错误 message、不进日志；错误 message 在拼好后再经 `sanitizeSecrets()`。
-- 数据形状：`ZcodeBillingSnapshot { fetchedAt, plans[], balances[] }`。`plans[]` 带 `planId/name/status/startsAt/endsAt/entitlements[]`（`showName/grantUnits/capabilities/unitType/period`），`balances[]` 带 `showName/totalUnits/usedUnits/remainingUnits/availableUnits/expiresAt/capabilities`。时间在 Node 半边保持 epoch 秒，卡片用 `Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai' })` 显示为 `YYYY-MM-DD HH:mm`。字段缺失一律记为 `null`，**不编造数值**；`plans` / `balances` 不是数组直接 `ZCODE_BILLING_PARSE`。
-- 卡片：`client/index.ts` 的 `useBilling()` 在 `useEffect` 里发相对路径 `fetch(BILLING_PATH)`（重试加 `?refresh=1`），带 `AbortController`，卸载时 `abort()`；加载中「读取中…」，失败显示错误码 + 一句话原因 + 「重新读取」按钮。文案全部来自 `client/locales.ts`（zh-CN / en-US 两本字典键集相同）。
-- 测试：`tests/billing.test.mjs` 20 例，现场用固定密钥 + 固定 IV 加密一段测试 token（不读真实凭据文件），mock 掉全部 `fetch`；覆盖解密往返、错误密钥、7 个载荷形状错误、6 个 HTTP/业务码分支、缓存命中/过期、`?refresh=1`、路由 405/403/成功/失败与 `setupBillingRoutes` 的挂载/卸载。
-
 ## 浏览器端卡片（client half）
 
 宿主给「设置 → 模型」里每个 provider 行渲染槽 `settings.models.provider-card`，槽位**没有回退表单**：找不到与 `entryKey` 匹配的卡片时行体就是空的。所以本包必须带一个浏览器半边，否则后端再正常，设置页里 ZCode 那一行也是空白。
 
 - 入口：`client/index.ts`（源码）→ `scripts/build-client.mjs`（TypeScript 编译器 API 打包）→ `dist/client.js`（单文件 ESM，`dist/` 被 gitignore，门禁构建它）。`package.json` 声明 `dsh.client = { inject: ['@deepseek-ai/dsh-client-ui-primitives'], platform: 'web' }` 与 `exports['./client']`。
 - 槽键：`ctx.slots.register({ name: 'settings.models.provider-card', key: 'dsh-zcode-provider', id: 'zcode-provider-card' }, …)`。`key` 必须**逐字等于** Node 半边的 `ZCODE_SETTINGS_NS`（`src/index.ts`），宿主按这个字符串匹配，写错一个字符就回到空白行。
-- 槽位 props 只有 `{ provider, configured, keyConfigured }`，**不含配置本体**（配置在同一个槽的兄弟表单里）。卡片上半部分是额度/套餐两块（数据来自上面那条 loopback 路由），下半部分是**只读信息面板**，显示随包发布的默认值（模型目录、`sessionMode` / `toolPolicy` / `mode` / `imageInput`、CLI 入口、环境契约、1309 说明），不是用户当前编辑中的值；面板里明确写了「以编辑表单为准」。除额度路由外，卡片不读写宿主配置。
-- Hook 纪律：`useState` / `useEffect` 只在组件上方的 `useTranslation()` 与 `useBilling()` 里，组件函数体**只有两句 hook（都在首行区）、只有一个 return**。宿主用 `SlotErrorBoundary` 包住槽内容，渲染期抛异常会渲染成空元素——hook 在条件 return 之后导致 hook 数变化时，症状与本次修的空白行一模一样。`tests/client.test.mjs` 把这条结构钉住。
+- 槽位 props 只有 `{ provider, configured, keyConfigured }`，**不含配置本体**（配置在同一个槽的兄弟表单里）。卡片上半部分是**运行配置块**（套餐 / 模型 / 推理强度三个 `<select>`，读写插件自己的 loopback state 路由），下半部分是**只读信息面板**：路由 / 命名空间 / 模型目录 / 随包默认值（`sessionMode` / `toolPolicy` / `mode` / `imageInput`）/ CLI 入口（`node` 与 `zcode.cjs` 绝对路径）/ 环境契约五变量。除该 state 路由外，卡片不读写宿主配置，也不碰任何 ZCode 文件。
+- state 路由契约：`GET`/`POST /plugins/dsh-zcode-provider/state`（`ZCODE_STATE_ROUTE_PATH`，`src/web/router.ts`；客户端字面量 `STATE_PATH`，`tests/client.test.mjs` 钉住两者相等）。成功信封 `{ ok: true, state: { plan, model, effort, plans[], models[], efforts[] }, error: null }`；失败 `{ ok: false, error: { code, message } }`；无法识别的值回 `400` + `error.code = 'INVALID_SELECTION'`。客户端 `readSelectionEnvelope()` 只接受 `ok === true` 且 `state` 齐备，否则渲染成一行失败提示而不是静默空白。
+- 选项语义：`plans` 两个（`free` 免费套餐 / `paid` 付费套餐）在 CLI 单通路下是**标签**，切换不改变 spawn 的 argv。`model` 与 `effort` 同样不改变 argv——0.17.0 的 CLI 没有 `--model` / `--effort` 旗标，实际跑哪个模型由 ZCode 自己的 `provider_config.json`（插件只读）决定。selection 的作用是**让卡片的选择与守卫一致**：请求模型与选择模型或配置默认模型都不相等时才 `MODEL_NOT_FOUND` 且不 spawn。
+- 样式：`client/styles.ts` 导出 `ZC_CSS`，由卡片在渲染树里 `h('style', null, ZC_CSS)` 注入；下拉样式照抄 `F:\defws\dsh-agy-provider\client\index.ts` 的 `.agy-select`（改名 `zc-select`，连同 `:root` 亮/暗色变量与 `.zc-btn`），这是用户明确要求「参考我已经做好的，不要自己造轮子」的落点。
+- Hook 纪律：`useState` / `useEffect` 只在组件上方的 `useTranslation()` 与 `useSelection()` 里，组件函数体**只有两句 hook（都在首行区）、只有一个 return**。宿主用 `SlotErrorBoundary` 包住槽内容，渲染期抛异常会渲染成空元素——hook 在条件 return 之后导致 hook 数变化时，症状与本卡片要修的空白行一模一样。`tests/client.test.mjs` 把这条结构钉住。
 - 漂移防线：卡片不能 import `src/provider/config.ts`（会拖入 schemastery 与适配器模块图，浏览器侧无法解析），所以模型目录、默认值与环境契约是**手抄字面量**；`tests/client.test.mjs` 逐项与 `src/` 和 `cordis.patch.yml` 比对，任一侧改了没同步就判红。
 
 ## 门禁
 
 `node scripts/run-tests.mjs` 是唯一入口，顺序固定：AC11（`client/`、`src/`、`tests/`、`scripts/`、`docs/` 与根级文本文件全部 LF、无 BOM）→ `tsc --noEmit` → `tsc`（build）→ `tsc -p tsconfig.client.json`（浏览器半边类型检查）→ `node scripts/build-client.mjs`（生成 `dist/client.js`）→ 包入口点（`main` / `types` / `exports` / `dsh.bundle.patch` 指向的文件存在，且 `dependencies` 为空）→ 测试面计数 → `node --test` → 用例数核对。`dist/client.js` 由门禁现建：它是 `exports['./client']` 的目标，且 `dist/` 不纳管，干净检出时不存在。
 
-测试面：`tests/` 下递归共 **12** 个 `*.test.mjs`，必须与脚本里的 `EXPECTED_TEST_FILES` 集合相等，也必须等于本行声明的数字（`declaredTestCount()` 解析本行）。少一个、多一个、改名一个都会让门禁在跑测试前就停——不允许「测试变少、门禁仍绿」。
+测试面：`tests/` 下递归共 **10** 个 `*.test.mjs`，必须与脚本里的 `EXPECTED_TEST_FILES` 集合相等，也必须等于本行声明的数字（`declaredTestCount()` 解析本行）。少一个、多一个、改名一个都会让门禁在跑测试前就停——不允许「测试变少、门禁仍绿」。
 
-测试用例：`node --test` 汇总的用例总数共 **221** 个（`ℹ tests 221`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
+测试用例：`node --test` 汇总的用例总数共 **139** 个（`ℹ tests 139`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
 
-受控文件：`git ls-files` 共 **39** 个 = 15 个 `src/**` 源文件（`index.ts`、`diagnostics.ts`、`doctor.ts`、`selection.ts`、`provider/{config,error-codes,zcode}.ts`、`session/{file-store,store}.ts`、`web/router.ts`、`zcode/{billing,http-channel,parser,prefix,process}.ts`）+ 2 个 `client/` 源文件（`index.ts`、`locales.ts`）+ 12 个 `tests/**/*.test.mjs` + 3 个 `scripts/`（`run-tests.mjs`、`build-client.mjs`、`install-env.ps1`）+ 1 个 `docs/dsh-provider-contract.md` + 6 个根级文件（`.gitignore`、`README.md`、`cordis.patch.yml`、`package.json`、`tsconfig.json`、`tsconfig.client.json`）。门禁会拿 `git ls-files` 的实点数与这一行比对，改文件数必须同步改这行。
+受控文件：`git ls-files` 共 **36** 个 = 13 个 `src/**` 源文件（`index.ts`、`diagnostics.ts`、`doctor.ts`、`selection.ts`、`provider/{config,error-codes,zcode}.ts`、`session/{file-store,store}.ts`、`web/router.ts`、`zcode/{parser,prefix,process}.ts`）+ 3 个 `client/` 源文件（`index.ts`、`locales.ts`、`styles.ts`）+ 10 个 `tests/**/*.test.mjs` + 3 个 `scripts/`（`run-tests.mjs`、`build-client.mjs`、`install-env.ps1`）+ 1 个 `docs/dsh-provider-contract.md` + 6 个根级文件（`.gitignore`、`README.md`、`cordis.patch.yml`、`package.json`、`tsconfig.json`、`tsconfig.client.json`）。门禁会拿 `git ls-files` 的实点数与这一行比对，改文件数必须同步改这行。
 
 ## 已知限制
 
@@ -292,6 +269,3 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 - **L8 工具面由 CLI 自己管**：`toolPolicy: reject` 只拒绝**下发 DSH 的工具 schema**；它关不掉 ZCode CLI 自身的工具能力。`--mode guarded` 下 CLI 内部工具（读写文件、执行命令）的行为**未验证**（账号 1309，无法实测）。因此本文档**不宣称「工具已禁用」**，只说「DSH 侧的工具调用不会被下发、也不会被接受」。
 - **L9 prompt 在进程命令行可见**：ZCode 的 `-p` 形态把整轮 prompt 放进 argv，同机其他进程读得到命令行。这是 CLI 协议固有，本 provider 无法规避；不要把凭据写进 prompt。
 - **L10 原子写只在单进程内有效**：`sessions.json` 用 `tmp + rename` 并带 `pid + uuid` 临时名，能防半写与名字碰撞；没有跨进程锁，同一 `sessionStorePath` 被两个 DSH 实例同时写不是一个受支持的情形。
-- **L11 额度面板依赖凭据可解密**：面板复用 ZCode CLI 写入 `credentials.json` 的 token。用 `ZCODE_CREDENTIAL_SECRET` 登录、之后又换了该变量（或换了 OS 账号），解密会失败并显示 `ZCODE_CREDENTIAL_DECRYPT_FAILED`——这不是插件坏了，重新登录或改回原 secret 即可。跨机器复制 `credentials.json` 同理不可用（key 派生自本机指纹）。
-- **L12 面板是只读读数的时点快照**：30 秒进程内缓存意味着「到期 / 剩余」最多滞后 30 秒；`?refresh=1` 只跳过缓存，不能强制服务端重算。路由只对 loopback 开放（403 拒绝其他对端），但没有额外的鉴权层——能访问本机 HTTP 端口的进程就能读到额度读数。
-- **L13 额度面板不判权益**：它只展示服务端返回的 plans / balances，不用来拦截请求；套餐到期仍由 CLI 侧 stderr 的 `[1309]` 体现（见 L5）。

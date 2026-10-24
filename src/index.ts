@@ -9,14 +9,12 @@
  */
 
 import { existsSync } from 'node:fs'
-import { dirname } from 'node:path'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 
 import { BundleConfig, configBoolean, type Config as ConfigType } from './provider/config.js'
 import { createZcodeWebRoutes, type ZcodeWebServerLike } from './web/router.js'
-import { setupBillingRoutes } from './web/router.js'
 import { SelectionStore } from './selection.js'
 
 /** Disposers for the routes this bundle mounted; drained on dispose. */
@@ -25,7 +23,7 @@ const webServerDisposers: Array<() => void> = []
 /**
  * The live selection store, if `apply` has run.
  *
- * The adapter reads the same store the card writes, so switching channel, model
+ * The adapter reads the same store the card writes, so switching plan, model
  * or effort takes effect on the next turn instead of needing a host restart.
  */
 let selectionStoreRef: SelectionStore | undefined
@@ -134,22 +132,6 @@ async function catalogProbe(ctx: ProbeContext, webServer: ZcodeWebServerLike | u
   return report
 }
 
-/**
- * ZCode's data root: the directory that contains `.zcode/v2/`.
- *
- * `ZCODE_DATA_BASE_DIR` is the documented env name; a profile that only set
- * `ZCODE_HOME` still resolves, since that one points one level deeper at the
- * `.zcode` folder itself. An empty result is acceptable here — the quota reader
- * reports the missing credential itself rather than the card failing to mount.
- */
-function zcodeDataBaseDir(): string {
-  const explicit = process.env['ZCODE_DATA_BASE_DIR']?.trim()
-  if (explicit !== undefined && explicit !== '') return explicit
-  const home = process.env['ZCODE_HOME']?.trim()
-  if (home !== undefined && home !== '') return dirname(home)
-  return ''
-}
-
 /** Plugin identity; also the settings namespace the Models page keys on. */
 export const name = 'dsh-zcode-provider'
 
@@ -196,7 +178,7 @@ export interface ZcodeAdapterDeps {
    * the registration surface and loads the adapter dynamically, so a static
    * import of its types would make the two modules fail together.
    */
-  readonly getSelection?: (() => { readonly channel?: string; readonly model?: string; readonly effort?: string } | undefined) | undefined
+  readonly getSelection?: (() => { readonly plan?: string; readonly model?: string; readonly effort?: string } | undefined) | undefined
 }
 
 /** The slice of a DSH session record this entry reads. */
@@ -283,14 +265,14 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
     logger.warn('zcode: configurable provider registration refused: %s', describe(error))
   }
 
-  // Settings card: the card reads its state (channel, model, effort) and the
-  // quota snapshot over two loopback routes, and writes the selection back over
-  // the same state route. The selection lives in the plugin's own file store —
-  // never in ZCode's `provider_config.json`, which belongs to another
-  // application and carries its API key.
+  // Settings card: the card reads its state (plan, model, effort) over a
+  // loopback route and writes the selection back over the same route. The
+  // selection lives in the plugin's own file store — never in ZCode's
+  // `provider_config.json`, which belongs to another application and carries
+  // its API key.
   //
   // Mounted before the `enabled` check on purpose: the card stays readable and
-  // the selection stay switchable even when the adapter is off. A host without
+  // the selection stays switchable even when the adapter is off. A host without
   // a web server simply never runs the registration callback, and any failure
   // here costs the panel, never the provider row registered above.
   const selectionStore = new SelectionStore({
@@ -305,20 +287,10 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
     logger.warn('zcode: selection not primed: %s', describe(error))
   }
 
-  // Quota panel: one loopback GET over the plugin's own web route. Mounted
-  // before the `enabled` check for the same reason as the settings routes
-  // above — the card stays readable even when the adapter is switched off.
-  try {
-    setupBillingRoutes(ctx)
-  } catch (error) {
-    logger.warn('zcode: billing endpoint not mounted: %s', describe(error))
-  }
-
   try {
     const routes = createZcodeWebRoutes({
       getConfig: () => selectionStore.get(),
       setSelection: async (patch) => { await selectionStore.write(patch) },
-      dataBaseDir: zcodeDataBaseDir(),
       probe: async () => catalogProbe(ctx as unknown as ProbeContext, webServerRef()),
     })
     ctx.inject(['webServer'], (innerCtx) => {
@@ -379,11 +351,12 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
       }
     },
     resolveWorkspaceRoot: createWorkspaceRootResolver(ctx),
-    // The adapter reads what the card last wrote, so a switch reaches the next
-    // turn instead of the next host restart. Gated on the file existing: the
-    // store hands out its defaults for a missing file, and those defaults name
-    // `free` — handing them over would move a profile that deliberately runs
-    // `cli` onto an unverified transport the moment it boots.
+    // Re-read on every call: the card writes the store between turns, so a
+    // one-shot read here would freeze whatever was selected at boot.
+    // Still gated on the file existing: the store hands out its defaults for a
+    // missing file, and those defaults name `free` — handing them over would
+    // move a profile that deliberately runs `paid` onto an unverified plan the
+    // moment it boots.
     getSelection: () => {
       try {
         return existsSync(selectionStore.filePath) ? selectionStore.get() : undefined

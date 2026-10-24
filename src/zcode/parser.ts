@@ -339,7 +339,7 @@ function finishReasonOf(node: Record<string, unknown>): string | undefined {
 /**
  * Turn an in-band `error` frame into a classified ZcodeError.
  *
- * The JSON is handed to {@link classifyStderr} as text so that both channels
+ * The JSON is handed to {@link classifyStderr} as text so that both sources
  * share one mapping table: an in-band provider code and a stderr provider code
  * must never disagree about what `1309` means.
  */

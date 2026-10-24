@@ -1,5 +1,5 @@
 /**
- * Plugin-owned selection store: which channel, model and reasoning effort the
+ * Plugin-owned selection store: which plan, model and reasoning effort the
  * user picked in the settings card.
  *
  * Why a file of our own instead of the bundle config: the card has to change
@@ -15,10 +15,10 @@ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-/** Channels the adapter can route a turn through. */
-export const ZCODE_CHANNEL_IDS = ['free', 'paid', 'cli'] as const
-/** One channel id. */
-export type ZcodeChannelId = typeof ZCODE_CHANNEL_IDS[number]
+/** Plans the settings card can show. */
+export const ZCODE_PLAN_IDS = ['free', 'paid'] as const
+/** One plan id. */
+export type ZcodePlanId = typeof ZCODE_PLAN_IDS[number]
 
 /** Reasoning efforts the upstream accepts in `output_config.effort`. */
 export const ZCODE_EFFORT_IDS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
@@ -32,27 +32,24 @@ export type ZcodeModelId = typeof ZCODE_MODEL_IDS[number]
 
 /** The selection the card shows and the adapter uses. */
 export interface ZcodeSelectionState {
-  readonly channel: ZcodeChannelId
+  readonly plan: ZcodePlanId
   readonly model: ZcodeModelId
   readonly effort: ZcodeEffortId
 }
 
 /** A partial write: only the keys present change. */
 export interface ZcodeSelectionPatch {
-  readonly channel?: string
+  readonly plan?: string
   readonly model?: string
   readonly effort?: string
 }
 
 /** Used when the file is missing, unreadable or carries an unknown value. */
 export const ZCODE_DEFAULT_SELECTION: ZcodeSelectionState = Object.freeze({
-  // `cli` is the default because it is the only transport where the official
-  // binary signs its own requests. The direct HTTP channels replay the CLI's
-  // request shape, and ZCode's risk control answers `405 [3012] request has
-  // been blocked due to unusual activity` once it decides the caller is not the
-  // CLI — observed on this account after a handful of turns, with time-based
-  // penalties. So HTTP stays selectable, but never the default.
-  channel: 'cli',
+  // `free` is the default plan: it is the one the CLI signs its own requests
+  // with, so no extra credential is needed. `paid` only changes what the card
+  // shows; the transport is always the official CLI subprocess.
+  plan: 'free',
   model: 'GLM-5.3-Flash',
   effort: 'max',
 })
@@ -73,32 +70,32 @@ export function parseSelectionState(
   value: unknown,
 ): { readonly selection: ZcodeSelectionState; readonly changed: boolean } {
   const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
-  const channel = includes(ZCODE_CHANNEL_IDS, record['channel']) ? record['channel'] : ZCODE_DEFAULT_SELECTION.channel
+  const plan = includes(ZCODE_PLAN_IDS, record['plan']) ? record['plan'] : ZCODE_DEFAULT_SELECTION.plan
   const model = includes(ZCODE_MODEL_IDS, record['model']) ? record['model'] : ZCODE_DEFAULT_SELECTION.model
   const effort = includes(ZCODE_EFFORT_IDS, record['effort']) ? record['effort'] : ZCODE_DEFAULT_SELECTION.effort
-  const changed = channel !== record['channel'] || model !== record['model'] || effort !== record['effort']
-  return { selection: { channel, model, effort }, changed }
+  const changed = plan !== record['plan'] || model !== record['model'] || effort !== record['effort']
+  return { selection: { plan, model, effort }, changed }
 }
 
 /**
  * Apply a partial patch onto a selection.
  *
  * @throws RangeError when a provided value is not a known id — a caller that
- * tries to write `channel: 'yolo'` must be told, not silently clamped.
+ * tries to write `plan: 'yolo'` must be told, not silently clamped.
  */
 export function applySelectionPatch(
   current: ZcodeSelectionState,
   patch: ZcodeSelectionPatch,
 ): ZcodeSelectionState {
   const next = {
-    channel: patch.channel === undefined ? current.channel : patch.channel,
+    plan: patch.plan === undefined ? current.plan : patch.plan,
     model: patch.model === undefined ? current.model : patch.model,
     effort: patch.effort === undefined ? current.effort : patch.effort,
   }
-  if (!includes(ZCODE_CHANNEL_IDS, next.channel)) throw new RangeError(`unknown channel: ${String(next.channel)}`)
+  if (!includes(ZCODE_PLAN_IDS, next.plan)) throw new RangeError(`unknown plan: ${String(next.plan)}`)
   if (!includes(ZCODE_MODEL_IDS, next.model)) throw new RangeError(`unknown model: ${String(next.model)}`)
   if (!includes(ZCODE_EFFORT_IDS, next.effort)) throw new RangeError(`unknown effort: ${String(next.effort)}`)
-  return { channel: next.channel, model: next.model, effort: next.effort }
+  return { plan: next.plan, model: next.model, effort: next.effort }
 }
 
 /** Resolve the selection file path without touching the disk. */

@@ -47,9 +47,9 @@ date: 'Fri, 23 Oct 2026 17:12:35 GMT', 'x-process-time': '0.298755'`
 const RATE_LIMIT_STDERR = 'ProviderBusinessError: [3007][请求过于频繁，请稍后重试][2026102401123552bbdbe6a99a4f3e]'
 const PERMISSION_STDERR = 'ProviderBusinessError: [3012][unusual activity detected][2026102401123552bbdbe6a99a4f3f]'
 
-test('ZCODE_ERROR_CODES is the frozen list of 25 unique string codes', () => {
-  assert.equal(ZCODE_ERROR_CODES.length, 25)
-  assert.equal(new Set(ZCODE_ERROR_CODES).size, 25)
+test('ZCODE_ERROR_CODES is the frozen list of 17 unique string codes', () => {
+  assert.equal(ZCODE_ERROR_CODES.length, 17)
+  assert.equal(new Set(ZCODE_ERROR_CODES).size, 17)
   for (const code of ZCODE_ERROR_CODES) {
     assert.equal(typeof code, 'string')
     assert.match(code, /^[A-Z][A-Z0-9_]*$/)
@@ -58,20 +58,8 @@ test('ZCODE_ERROR_CODES is the frozen list of 25 unique string codes', () => {
   // The two codes B5 needs are part of the same frozen list.
   assert.ok(ZCODE_ERROR_CODES.includes('PERMISSION_REQUIRED'))
   assert.ok(ZCODE_ERROR_CODES.includes('UNSUPPORTED_TOOLS'))
-  // The quota panel's read path: credential store, upstream classification and
-  // payload validation each get their own code, so the card can say which.
-  for (const code of [
-    'ZCODE_ENV_MISSING',
-    'ZCODE_CREDENTIAL_MISSING',
-    'ZCODE_CREDENTIAL_INVALID',
-    'ZCODE_CREDENTIAL_DECRYPT_FAILED',
-    'ZCODE_BILLING_UNAUTHORIZED',
-    'ZCODE_BILLING_BAD_REQUEST',
-    'ZCODE_BILLING_HTTP',
-    'ZCODE_BILLING_PARSE',
-  ]) {
-    assert.ok(ZCODE_ERROR_CODES.includes(code), `missing ${code}`)
-  }
+  // The CLI route still needs its own environment contract code.
+  assert.ok(ZCODE_ERROR_CODES.includes('ZCODE_ENV_MISSING'))
   // Round-1 review additions: contract refusals, backpressure/output limits, and
   // the fail-closed workspace lookup.
   for (const code of [
