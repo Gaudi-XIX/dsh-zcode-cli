@@ -37,8 +37,16 @@ export const ZCODE_BILLING_CACHE_TTL_MS = 30_000
 /** Prefix the credential store puts in front of an encrypted value. */
 const CREDENTIAL_PREFIX = 'enc:v1:'
 
-/** AES-256-GCM layout used by the ZCode credential store: 16-byte IV, 16-byte tag. */
-const GCM_IV_BYTES = 16
+/**
+ * AES-256-GCM layout used by the ZCode credential store.
+ *
+ * Measured on a real `credentials.json` (2026-10-24): the three base64url
+ * segments decode to **12** IV bytes, 16 tag bytes and the ciphertext. GCM's
+ * canonical nonce is 12 bytes, so a 16-byte IV would reject every credential
+ * the CLI actually writes — the offline test vector originally used 16 and hid
+ * that, which is why this constant now carries the measured number.
+ */
+const GCM_IV_BYTES = 12
 const GCM_TAG_BYTES = 16
 
 /** base64url without padding; anything else is a corrupt payload, not a token. */

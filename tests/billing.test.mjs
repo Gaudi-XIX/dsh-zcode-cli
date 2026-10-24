@@ -34,7 +34,7 @@ const TOKEN = 'offline-jwt-value'
 const DEVICE_MID = 'device-mid-offline'
 
 /** Encrypt TOKEN the way the ZCode credential store does. */
-function encryptToken(secret = SECRET, plaintext = TOKEN, iv = Buffer.alloc(16, 7)) {
+function encryptToken(secret = SECRET, plaintext = TOKEN, iv = Buffer.alloc(12, 7)) {
   const key = createHash('sha256').update(secret, 'utf8').digest()
   const cipher = createCipheriv('aes-256-gcm', key, iv)
   const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()])
