@@ -186,6 +186,13 @@ export function setupBillingRoutes(ctx: Context, options: BillingRouteOptions = 
 export const ZCODE_STATE_ROUTE_PATH = '/plugins/dsh-zcode-provider/state'
 /** Exact path of the quota route (GET). */
 export const ZCODE_QUOTA_ROUTE_PATH = '/plugins/dsh-zcode-provider/quota'
+/**
+ * Host-side diagnostic route. Loopback-only, read-only, and mounted only when
+ * the caller injects a probe: it exists to answer questions only the host
+ * process can answer (why the model picker hides this provider, whether the
+ * browser half reached `window.__DSH_BOOT__`).
+ */
+export const ZCODE_DIAG_ROUTE_PATH = '/plugins/dsh-zcode-provider/diag'
 
 /** Effort ids the host accepts on this route. Frozen with the card. */
 export const ZCODE_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
@@ -235,6 +242,13 @@ export interface ZcodeWebRoutesDeps {
   readonly now?: () => number
   /** Injected for the tests; defaults to a 30-second reader. */
   readonly quotaReader?: QuotaReader
+  /**
+   * Optional host-side probe. The provider row can be correct while the model
+   * picker still hides the provider (the host drops a group whose model
+   * resolution throws), so the only place that can answer "why" is the host
+   * process itself. Absent in production until a caller wires it.
+   */
+  readonly probe?: () => Promise<unknown>
 }
 
 /** The slice of the host web server this module uses. */
@@ -527,6 +541,25 @@ export function createZcodeWebRoutes(deps: ZcodeWebRoutesDeps): ZcodeWebRoutes {
     }
   }
 
+  const probeHandler = deps.probe === undefined
+    ? undefined
+    : async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      if (!isLoopbackRequest(req)) {
+        sendRouteJson(res, 403, { ok: false, error: 'FORBIDDEN' })
+        return
+      }
+      if (req.method !== 'GET') {
+        sendRouteJson(res, 405, { ok: false, error: 'METHOD_NOT_ALLOWED' })
+        return
+      }
+      try {
+        const probe = deps.probe
+        sendRouteJson(res, 200, { ok: true, probe: await probe!() })
+      } catch (error) {
+        sendRouteJson(res, 500, { ok: false, error: 'PROBE_FAILED', detail: sanitizeSecrets(describe(error)) })
+      }
+    }
+
   return {
     register(server: ZcodeWebServerLike): () => void {
       if (server === null || server === undefined || typeof server.register !== 'function') return () => {}
@@ -534,6 +567,7 @@ export function createZcodeWebRoutes(deps: ZcodeWebRoutesDeps): ZcodeWebRoutes {
       const routes: ReadonlyArray<readonly [string, (req: IncomingMessage, res: ServerResponse) => Promise<void>]> = [
         [ZCODE_STATE_ROUTE_PATH, stateHandler],
         [ZCODE_QUOTA_ROUTE_PATH, quotaHandler],
+        ...(probeHandler === undefined ? [] : [[ZCODE_DIAG_ROUTE_PATH, probeHandler]] as const),
       ]
       for (const [path, handler] of routes) {
         try {

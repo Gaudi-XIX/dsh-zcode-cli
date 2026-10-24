@@ -216,24 +216,37 @@ test('listModels honors visibleModels and advertises text-only input', async () 
   assert.deepEqual(filtered.map(model => model.id), ['GLM-5.3'])
 })
 
-test('resolveModel refuses an unknown id and any id the CLI cannot run', async () => {
+test('resolveModel refuses an unknown id and resolves every advertised one', async () => {
   const instance = adapter({}, { models: [{ id: 'GLM-5.3-Flash' }, { id: 'GLM-5.3', contextWindow: 200_000 }] })
 
   await assert.rejects(
     () => instance.resolveModel('zcode', 'not-a-model'),
     error => error.code === 'MODEL_NOT_FOUND' && /configured catalog/.test(error.message),
   )
-  // Advertised but not the configured model: the CLI has no --model flag, so
-  // running it would answer with a different model than the one requested.
-  await assert.rejects(
-    () => instance.resolveModel('zcode', 'GLM-5.3'),
-    error => error.code === 'MODEL_NOT_FOUND' && /no --model flag/.test(error.message),
-  )
+  // Advertised but not the configured model: resolution still succeeds, because
+  // the host builds the picker by resolving every listed model and one throw
+  // drops the whole provider from the catalog. The cli channel refuses such a
+  // model at the turn instead — covered by its own test below.
+  const other = await instance.resolveModel('zcode', 'GLM-5.3')
+  assert.equal(other.id, 'GLM-5.3')
+  assert.equal(other.provider, 'zcode')
+  assert.deepEqual(other.context, { contextWindow: 200_000 })
 
   const resolved = await instance.resolveModel('zcode', 'GLM-5.3-Flash')
   assert.equal(resolved.id, 'GLM-5.3-Flash')
   assert.equal(resolved.provider, 'zcode')
   assert.deepEqual(resolved.inputModalities, ['text'])
+})
+
+test('the cli channel refuses a model it cannot run, at the turn', async () => {
+  const instance = adapter({}, { models: [{ id: 'GLM-5.3-Flash' }, { id: 'GLM-5.3' }] })
+
+  const chunks = await collect(instance.stream(request('@@json@@', { model: 'GLM-5.3' })))
+  const failure = terminalFailure(chunks)
+  assert.equal(failure.code, 'MODEL_NOT_FOUND')
+  assert.match(failure.message, /no --model flag/)
+  // Refused before any spawn: the fake CLI would have logged an argv row.
+  assert.equal(argvLog().length, 0)
 })
 
 test('a successful turn emits block-start, deltas, block-end, usage, finish', async t => {

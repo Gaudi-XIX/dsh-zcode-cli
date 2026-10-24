@@ -420,10 +420,12 @@ export class ZcodeAdapter extends LlmAdapter {
   /**
    * Resolve one exact model.
    *
-   * The CLI has no `--model` flag: what runs is whatever the ZCode client's own
-   * default model is. So the configured `model` is the only id that can be
-   * honored, and any other id fails here with an actionable message instead of
-   * running a different model under the requested name (design.md D2).
+   * Resolution is metadata, never admission: the host builds the browser catalog
+   * by resolving *every* advertised model, and one throw demotes the whole
+   * provider into `failures` — which is exactly how a provider disappears from
+   * the model picker. So a model that this channel cannot actually run still
+   * resolves here, and the turn refuses it with `MODEL_NOT_FOUND` instead
+   * (`stream`, cli branch). Only an id outside the advertised catalog throws.
    */
   override async resolveModel(
     provider: string,
@@ -434,13 +436,6 @@ export class ZcodeAdapter extends LlmAdapter {
     if (entry === undefined) {
       throw new LlmError(
         `ZCode does not advertise model "${model}"; the configured catalog is ${this.catalog.map(item => item.id).join(', ')}`,
-        'MODEL_NOT_FOUND',
-      )
-    }
-    if (entry.id !== this.model) {
-      throw new LlmError(
-        `ZCode 0.17.0 has no --model flag, so only the configured model "${this.model}" can run; `
-        + `select "${entry.id}" in the ZCode client and set it as the default model there, then set model: ${entry.id} here`,
         'MODEL_NOT_FOUND',
       )
     }
@@ -467,6 +462,23 @@ export class ZcodeAdapter extends LlmAdapter {
     if (transport.channel !== 'cli') {
       const channel: ZcodeCredentialChannel = transport.channel
       yield* this.streamOverHttp(options, channel, transport.model, transport.effort)
+      return
+    }
+    // The cli channel has no `--model` flag, so a requested model it cannot
+    // honor fails here — at the turn — rather than in `resolveModel`, which must
+    // advertise every listed model or the host drops the provider from the picker.
+    if (options.model !== this.model) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            code: 'MODEL_NOT_FOUND',
+            message: `ZCode 0.17.0 has no --model flag, so the cli channel can only run the configured model "${this.model}"; `
+              + `switch the channel to free or paid to run "${options.model}"`,
+          },
+        },
+      }
       return
     }
     const conversationId = options.sessionId === undefined ? undefined : String(options.sessionId)

@@ -35,6 +35,105 @@ export function getSelectionStore(): SelectionStore | undefined {
   return selectionStoreRef
 }
 
+/** The host web server this bundle mounted onto, captured for the probe route. */
+let mountedWebServer: ZcodeWebServerLike | undefined
+
+function webServerRef(): ZcodeWebServerLike | undefined {
+  return mountedWebServer
+}
+
+/**
+ * The slice of the host context the diagnostic probe reads.
+ *
+ * Declared structurally instead of importing the full host types: the probe is
+ * diagnostic only, and a wrong guess about an optional service must degrade to
+ * a note in the report rather than a compile error in the provider path.
+ */
+interface ProbeContext {
+  readonly llm?: {
+    listProviders(): ReadonlyArray<{ id: string; name?: string }>
+    listModels?(provider: string): Promise<ReadonlyArray<{ id: string; name?: string }>>
+    resolveModelInfo?(provider: string, model: string): Promise<unknown>
+  }
+  get?(name: string): unknown
+}
+
+/** Describe an unknown thrown value without leaking secrets. */
+function probeError(error: unknown): string {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+}
+
+/**
+ * Answer, from inside the host process, the two questions a browser cannot:
+ * does the LLM registry really resolve this provider's models (the picker drops
+ * a group whose resolution throws), and did the browser half reach the client
+ * module graph (the settings card is served from there).
+ */
+async function catalogProbe(ctx: ProbeContext, webServer: ZcodeWebServerLike | undefined): Promise<unknown> {
+  const report: Record<string, unknown> = {
+    probeVersion: 'diag-1',
+    webServerMounted: webServer !== undefined,
+  }
+
+  const llm = ctx.llm
+  if (llm === undefined) {
+    report['llm'] = 'absent'
+  } else {
+    let providers: unknown = null
+    try {
+      providers = llm.listProviders().map((provider) => ({ id: provider.id, name: provider.name }))
+    } catch (error) {
+      providers = probeError(error)
+    }
+    const perProvider: Record<string, unknown> = {}
+    try {
+      for (const provider of llm.listProviders()) {
+        const row: Record<string, unknown> = {}
+        try {
+          const models = await llm.listModels!(provider.id)
+          row['models'] = models.map((model) => ({ id: model.id, name: model.name }))
+          const resolved: Record<string, unknown> = {}
+          for (const model of models) {
+            try {
+              resolved[model.id] = await llm.resolveModelInfo!(provider.id, model.id)
+            } catch (error) {
+              resolved[model.id] = `THREW ${probeError(error)}`
+            }
+          }
+          row['resolved'] = resolved
+        } catch (error) {
+          row['error'] = probeError(error)
+        }
+        perProvider[provider.id] = row
+      }
+    } catch (error) {
+      perProvider['enumerate'] = probeError(error)
+    }
+    report['llm'] = { providers, perProvider }
+  }
+
+  const clientModules = ctx.get?.('clientModules')
+  if (clientModules === undefined || clientModules === null) {
+    report['clientModules'] = 'absent'
+  } else {
+    const shape: Record<string, unknown> = { ownKeys: Object.keys(clientModules as object) }
+    const graph = (clientModules as { graph?: () => unknown }).graph
+    if (typeof graph === 'function') {
+      try {
+        const value = graph.call(clientModules) as { entries?: unknown }
+        shape['graph'] = value === null || value === undefined
+          ? value
+          : { entries: value.entries }
+      } catch (error) {
+        shape['graph'] = `THREW ${probeError(error)}`
+      }
+    }
+    report['clientModules'] = shape
+  }
+
+  return report
+}
+
 /**
  * ZCode's data root: the directory that contains `.zcode/v2/`.
  *
@@ -220,10 +319,12 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
       getConfig: () => selectionStore.get(),
       setSelection: async (patch) => { await selectionStore.write(patch) },
       dataBaseDir: zcodeDataBaseDir(),
+      probe: async () => catalogProbe(ctx as unknown as ProbeContext, webServerRef()),
     })
     ctx.inject(['webServer'], (innerCtx) => {
       const webServer = (innerCtx as unknown as { webServer?: ZcodeWebServerLike }).webServer
       if (webServer === undefined || typeof webServer.register !== 'function') return
+      mountedWebServer = webServer
       try {
         webServerDisposers.push(routes.register(webServer))
       } catch (error) {

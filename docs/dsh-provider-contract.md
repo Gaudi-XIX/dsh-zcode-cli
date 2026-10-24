@@ -276,7 +276,7 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 
 测试面：`tests/` 下递归共 **12** 个 `*.test.mjs`，必须与脚本里的 `EXPECTED_TEST_FILES` 集合相等，也必须等于本行声明的数字（`declaredTestCount()` 解析本行）。少一个、多一个、改名一个都会让门禁在跑测试前就停——不允许「测试变少、门禁仍绿」。
 
-测试用例：`node --test` 汇总的用例总数共 **220** 个（`ℹ tests 220`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
+测试用例：`node --test` 汇总的用例总数共 **221** 个（`ℹ tests 221`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
 
 受控文件：`git ls-files` 共 **39** 个 = 15 个 `src/**` 源文件（`index.ts`、`diagnostics.ts`、`doctor.ts`、`selection.ts`、`provider/{config,error-codes,zcode}.ts`、`session/{file-store,store}.ts`、`web/router.ts`、`zcode/{billing,http-channel,parser,prefix,process}.ts`）+ 2 个 `client/` 源文件（`index.ts`、`locales.ts`）+ 12 个 `tests/**/*.test.mjs` + 3 个 `scripts/`（`run-tests.mjs`、`build-client.mjs`、`install-env.ps1`）+ 1 个 `docs/dsh-provider-contract.md` + 6 个根级文件（`.gitignore`、`README.md`、`cordis.patch.yml`、`package.json`、`tsconfig.json`、`tsconfig.client.json`）。门禁会拿 `git ls-files` 的实点数与这一行比对，改文件数必须同步改这行。
 
