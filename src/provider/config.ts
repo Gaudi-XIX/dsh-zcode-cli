@@ -15,6 +15,43 @@ export type ZcodeImageInput = 'off' | 'experimental'
  */
 export type ZcodeMode = 'guarded'
 
+/**
+ * Transport that serves a request.
+ *
+ * `cli` spawns `resources/glm/zcode.cjs` and inherits the CLI's own login.
+ * `free` and `paid` speak the Anthropic Messages endpoint directly — one HTTP
+ * request instead of one process — and differ only in identity: `free` uses the
+ * encrypted credential store the CLI maintains (device-bound), `paid` uses an
+ * API key from the environment.
+ */
+export type ZcodeChannel = 'cli' | 'free' | 'paid'
+
+/** The two channels that authenticate over HTTP; `cli` is not one of them. */
+export type ZcodeCredentialChannel = Exclude<ZcodeChannel, 'cli'>
+
+/** `output_config.effort` of the Messages request; the capture used `max`. */
+export type ZcodeEffort = 'low' | 'medium' | 'high' | 'max'
+
+/** Default channel: the spawned CLI, i.e. the path the earlier batches verified. */
+export const DEFAULT_CHANNEL: ZcodeChannel = 'cli'
+
+/** Default effort for the HTTP channels; `high` trades fewer tokens for less depth than `max`. */
+export const DEFAULT_EFFORT: ZcodeEffort = 'high'
+
+/** Paid (`open.bigmodel.cn`) Messages deployment; override with `paidBaseUrl`. */
+export const DEFAULT_PAID_BASE_URL = 'https://open.bigmodel.cn/api/anthropic'
+
+/**
+ * Environment variable holding the paid channel's API key.
+ *
+ * Deliberately not a config field: a profile file is copied, pasted into
+ * issues and committed; an environment variable is the narrower blast radius.
+ */
+export const ZCODE_PAID_API_KEY_ENV = 'ZCODE_PAID_API_KEY'
+
+/** Environment variable naming the ZCode *data* root (`<root>/.zcode/v2/...`). */
+export const ZCODE_DATA_BASE_DIR_ENV = 'ZCODE_DATA_BASE_DIR'
+
 export interface ModelConfig {
   /** Exact model id passed to ZCode. */
   id: string
@@ -40,6 +77,16 @@ export interface Config {
   enabled?: boolean
   /** DSH provider route owned by this plugin. */
   provider?: string
+  /**
+   * Transport that serves requests. `cli` (default) spawns the ZCode CLI;
+   * `free` / `paid` call the Messages endpoint directly. The default stays
+   * `cli` so an existing profile keeps its verified behaviour.
+   */
+  channel?: ZcodeChannel
+  /** `output_config.effort` for the HTTP channels; the CLI channel ignores it. */
+  effort?: ZcodeEffort
+  /** Paid channel base URL; `/v1/messages` is appended when the path is absent. */
+  paidBaseUrl?: string
   /** ZCode model passed to the CLI when a request does not override it. */
   model?: string
   /** Explicit model catalog; `model` remains the default/fallback entry. */
@@ -163,6 +210,9 @@ export function createConfigSchema(defaults: {
     enabled: z.boolean().default(defaultEnabled).description('Enable ZCode provider').volatile(),
     // The route is fixed by this plugin and is not a user-facing setting.
     provider: z.string().default('zcode').description('Provider route id').hidden(),
+    channel: z.union(['cli', 'free', 'paid'] as const).default(DEFAULT_CHANNEL).description('Transport: cli spawns the ZCode CLI, free and paid call the Messages endpoint directly'),
+    effort: z.union(['low', 'medium', 'high', 'max'] as const).default(DEFAULT_EFFORT).description('output_config.effort sent by the HTTP channels (the CLI channel ignores it)'),
+    paidBaseUrl: z.string().pattern(/^\S(?:.*\S)?$/).default(DEFAULT_PAID_BASE_URL).description('Paid channel base URL; /v1/messages is appended when absent').hidden(),
     model: z.string().default(DEFAULT_MODEL).description('Default model id'),
     // Explicit catalogs are an advanced YAML escape hatch; the UI uses the catalog.
     models: z.array(ModelConfigSchema).default([...DEFAULT_MODELS]).description('Explicit model catalog').hidden(),
@@ -196,6 +246,9 @@ export function createConfigSchema(defaults: {
     'zh-CN': {
       enabled: { $description: '是否启用 ZCode 提供方' },
       provider: { $description: '提供方路由 ID（固定为 zcode）' },
+      channel: { $description: '传输通道：cli=拉起 ZCode CLI（默认）, free=免费通道直连 Messages 端点（读 CLI 已登录的加密凭据）, paid=付费通道直连（读 ZCODE_PAID_API_KEY）' },
+      effort: { $description: 'HTTP 通道发送的 output_config.effort；CLI 通道忽略此项' },
+      paidBaseUrl: { $description: '付费通道的 base URL；缺少 /v1/messages 时自动补上' },
       model: { $description: '默认模型 ID' },
       models: { $description: '显式模型目录；条目为基础 ID，可覆盖名称与上下文窗口' },
       visibleModels: { $description: '可见模型过滤；为空时显示全部目录条目，非空时仅显示列出的 ID' },
@@ -221,6 +274,9 @@ export function createConfigSchema(defaults: {
     en: {
       enabled: { $description: 'Enable ZCode provider' },
       provider: { $description: 'Provider route id (always zcode)' },
+      channel: { $description: 'Transport: cli spawns the ZCode CLI (default), free calls the Messages endpoint with the CLI login, paid calls it with ZCODE_PAID_API_KEY' },
+      effort: { $description: 'output_config.effort sent by the HTTP channels; the CLI channel ignores it' },
+      paidBaseUrl: { $description: 'Paid channel base URL; /v1/messages is appended when absent' },
       model: { $description: 'Default model id' },
       models: { $description: 'Explicit model catalog; entries are base ids' },
       visibleModels: { $description: 'Visible models filter; empty shows every catalog entry, non-empty only shows the listed ids' },

@@ -199,9 +199,11 @@ test('registration has no boot-time side effects: no env read, no process, no fi
       ZCODE_ENV_CONTRACT.filter(entry => process.env[entry.name] !== undefined).map(entry => entry.name),
       [],
     )
-    // 4. The only host surface touched is the one registration is allowed to
-    //    touch; a spawn or a file write would need another service.
-    assert.deepEqual([...new Set(calls.touched)].sort(), ['llm', 'logger'])
+    // 4. The only host surfaces touched are registration (`llm`, `logger`) and
+    //    the optional billing mount (`inject`), which is wrapped in try/catch:
+    //    a host without a web server must still mount the adapter. A spawn or a
+    //    file write would need another service and would show up here.
+    assert.deepEqual([...new Set(calls.touched)].sort(), ['inject', 'llm', 'logger'])
   } finally {
     for (const [name, value] of saved) {
       if (value === undefined) delete process.env[name]

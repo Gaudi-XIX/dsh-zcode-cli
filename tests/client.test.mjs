@@ -121,3 +121,65 @@ test('the card keeps a single exit with every hook above it', () => {
   }
   assert.ok(!body.includes('useRef('), 'the card has no refs; adding one must be a deliberate change to this test')
 })
+
+test('the quota blocks read the route the Node half actually mounts', () => {
+  const route = read('src/web/router.ts').match(/export const BILLING_ROUTE_PATH = '([^']+)'/)?.[1]
+  assert.ok(route !== undefined, 'src/web/router.ts no longer declares BILLING_ROUTE_PATH')
+  assert.ok(
+    clientEntry.includes(`const BILLING_PATH = '${route}'`),
+    `client BILLING_PATH must be the literal '${route}'`,
+  )
+  assert.match(clientEntry, /fetch\(force \? `\$\{BILLING_PATH\}\?refresh=1` : BILLING_PATH/)
+  // The panel must not reach into the credential path on its own: the token
+  // never leaves the Node half, so the browser half has no filesystem access.
+  assert.ok(!/credentials\.json|zcodejwttoken|telemetry-state/.test(clientEntry))
+})
+
+test('the fetch effect is abortable and every path cleans up', () => {
+  const start = clientEntry.indexOf('const useBilling = ')
+  const end = clientEntry.indexOf('// Keyed slot registration')
+  assert.ok(start > 0 && end > start, 'could not slice the billing hook; update this test with the file')
+  const hook = clientEntry.slice(start, end)
+  assert.match(hook, /new AbortController\(\)/)
+  assert.match(hook, /controller\.abort\(\)/, 'the effect must abort the in-flight request on unmount')
+  assert.match(hook, /requestBilling\([^)]*controller\.signal\)/, 'the abort signal must reach the request helper')
+  const returns = hook.match(/\breturn\b/g) ?? []
+  assert.ok(returns.length >= 1)
+})
+
+test('the locale dictionaries cover every quota/plan/billing string in both languages', () => {
+  const required = [
+    'card.billing.loading',
+    'card.billing.retry',
+    'card.billing.failed',
+    'card.billing.updated',
+    'card.billing.error.unknown',
+    'card.billing.error.ZCODE_CREDENTIAL_MISSING',
+    'card.billing.error.ZCODE_CREDENTIAL_INVALID',
+    'card.billing.error.ZCODE_CREDENTIAL_DECRYPT_FAILED',
+    'card.billing.error.ZCODE_BILLING_UNAUTHORIZED',
+    'card.billing.error.ZCODE_BILLING_BAD_REQUEST',
+    'card.billing.error.ZCODE_BILLING_HTTP',
+    'card.billing.error.ZCODE_BILLING_PARSE',
+    'card.billing.error.ZCODE_ENV_MISSING',
+    'card.quota.title',
+    'card.quota.remaining',
+    'card.quota.total',
+    'card.quota.expires',
+    'card.quota.empty',
+    'card.plans.title',
+    'card.plans.status',
+    'card.plans.period',
+    'card.plans.entitlements',
+    'card.plans.empty',
+  ]
+  const zhBlock = clientLocales.slice(clientLocales.indexOf('export const zh'), clientLocales.indexOf('export const en'))
+  const enBlock = clientLocales.slice(clientLocales.indexOf('export const en'))
+  for (const key of required) {
+    assert.ok(zhBlock.includes(`'${key}':`), `zh dictionary is missing ${key}`)
+    assert.ok(enBlock.includes(`'${key}':`), `en dictionary is missing ${key}`)
+  }
+  const zhKeys = [...zhBlock.matchAll(/^ {2}'([^']+)':/gmu)].map(match => match[1]).sort()
+  const enKeys = [...enBlock.matchAll(/^ {2}'([^']+)':/gmu)].map(match => match[1]).sort()
+  assert.deepEqual(enKeys, zhKeys, 'both dictionaries must carry the same key set')
+})

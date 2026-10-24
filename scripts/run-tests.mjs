@@ -65,10 +65,12 @@ const TEXT_EXTENSIONS = ['.ts', '.mjs', '.js', '.json', '.md', '.yml']
 const EXPECTED_TEST_FILES = [
   'adapter.test.mjs',
   'argv.test.mjs',
+  'billing.test.mjs',
   'client.test.mjs',
   'doctor.test.mjs',
   'env.test.mjs',
   'error-codes.test.mjs',
+  'http-channel.test.mjs',
   'parser.test.mjs',
   'process.test.mjs',
   'register.test.mjs',
@@ -84,7 +86,7 @@ const EXPECTED_TEST_FILES = [
  * `docs/dsh-provider-contract.md` and with the summary `node --test` prints.
  * Adding or removing a case means updating all three.
  */
-const EXPECTED_TEST_CASES = 135
+const EXPECTED_TEST_CASES = 212
 
 /**
  * Recursively collect `*.test.mjs` under the tests directory.

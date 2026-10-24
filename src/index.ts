@@ -8,10 +8,48 @@
  * half-mounted plugin.
  */
 
+import { existsSync } from 'node:fs'
+import { dirname } from 'node:path'
+
 import type { Context } from '@deepseek-ai/cordis'
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 
 import { BundleConfig, configBoolean, type Config as ConfigType } from './provider/config.js'
+import { createZcodeWebRoutes, type ZcodeWebServerLike } from './web/router.js'
+import { setupBillingRoutes } from './web/router.js'
+import { SelectionStore } from './selection.js'
+
+/** Disposers for the routes this bundle mounted; drained on dispose. */
+const webServerDisposers: Array<() => void> = []
+
+/**
+ * The live selection store, if `apply` has run.
+ *
+ * The adapter reads the same store the card writes, so switching channel, model
+ * or effort takes effect on the next turn instead of needing a host restart.
+ */
+let selectionStoreRef: SelectionStore | undefined
+
+/** The selection store mounted by this bundle, for the adapter and diagnostics. */
+export function getSelectionStore(): SelectionStore | undefined {
+  return selectionStoreRef
+}
+
+/**
+ * ZCode's data root: the directory that contains `.zcode/v2/`.
+ *
+ * `ZCODE_DATA_BASE_DIR` is the documented env name; a profile that only set
+ * `ZCODE_HOME` still resolves, since that one points one level deeper at the
+ * `.zcode` folder itself. An empty result is acceptable here — the quota reader
+ * reports the missing credential itself rather than the card failing to mount.
+ */
+function zcodeDataBaseDir(): string {
+  const explicit = process.env['ZCODE_DATA_BASE_DIR']?.trim()
+  if (explicit !== undefined && explicit !== '') return explicit
+  const home = process.env['ZCODE_HOME']?.trim()
+  if (home !== undefined && home !== '') return dirname(home)
+  return ''
+}
 
 /** Plugin identity; also the settings namespace the Models page keys on. */
 export const name = 'dsh-zcode-provider'
@@ -52,6 +90,14 @@ export interface ZcodeAdapterDeps {
   readonly logger: (record: unknown) => void
   /** Resolve the session workspace root; see {@link createWorkspaceRootResolver}. */
   readonly resolveWorkspaceRoot?: ((conversationId: string | undefined) => Promise<string | undefined>) | undefined
+  /**
+   * Read the live selection this entry's store holds.
+   *
+   * Typed structurally here rather than imported from the adapter: this file is
+   * the registration surface and loads the adapter dynamically, so a static
+   * import of its types would make the two modules fail together.
+   */
+  readonly getSelection?: (() => { readonly channel?: string; readonly model?: string; readonly effort?: string } | undefined) | undefined
 }
 
 /** The slice of a DSH session record this entry reads. */
@@ -138,6 +184,56 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
     logger.warn('zcode: configurable provider registration refused: %s', describe(error))
   }
 
+  // Settings card: the card reads its state (channel, model, effort) and the
+  // quota snapshot over two loopback routes, and writes the selection back over
+  // the same state route. The selection lives in the plugin's own file store —
+  // never in ZCode's `provider_config.json`, which belongs to another
+  // application and carries its API key.
+  //
+  // Mounted before the `enabled` check on purpose: the card stays readable and
+  // the selection stay switchable even when the adapter is off. A host without
+  // a web server simply never runs the registration callback, and any failure
+  // here costs the panel, never the provider row registered above.
+  const selectionStore = new SelectionStore({
+    onRecovery: (reason) => { logger.warn('zcode: selection recovered: %s', reason) },
+  })
+  selectionStoreRef = selectionStore
+  try {
+    await selectionStore.prime()
+  } catch (error) {
+    // `prime` already swallows the expected failures; this is belt and braces
+    // so a surprise never takes the provider row down with it.
+    logger.warn('zcode: selection not primed: %s', describe(error))
+  }
+
+  // Quota panel: one loopback GET over the plugin's own web route. Mounted
+  // before the `enabled` check for the same reason as the settings routes
+  // above — the card stays readable even when the adapter is switched off.
+  try {
+    setupBillingRoutes(ctx)
+  } catch (error) {
+    logger.warn('zcode: billing endpoint not mounted: %s', describe(error))
+  }
+
+  try {
+    const routes = createZcodeWebRoutes({
+      getConfig: () => selectionStore.get(),
+      setSelection: async (patch) => { await selectionStore.write(patch) },
+      dataBaseDir: zcodeDataBaseDir(),
+    })
+    ctx.inject(['webServer'], (innerCtx) => {
+      const webServer = (innerCtx as unknown as { webServer?: ZcodeWebServerLike }).webServer
+      if (webServer === undefined || typeof webServer.register !== 'function') return
+      try {
+        webServerDisposers.push(routes.register(webServer))
+      } catch (error) {
+        logger.warn('zcode: settings routes refused: %s', describe(error))
+      }
+    })
+  } catch (error) {
+    logger.warn('zcode: settings endpoint not mounted: %s', describe(error))
+  }
+
   // No `registerModelDiscovery`: ZCode 0.17.0 has no quota-free model listing,
   // so the catalog is static and discovery would have to spend a real turn.
 
@@ -182,6 +278,19 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
       }
     },
     resolveWorkspaceRoot: createWorkspaceRootResolver(ctx),
+    // The adapter reads what the card last wrote, so a switch reaches the next
+    // turn instead of the next host restart. Gated on the file existing: the
+    // store hands out its defaults for a missing file, and those defaults name
+    // `free` — handing them over would move a profile that deliberately runs
+    // `cli` onto an unverified transport the moment it boots.
+    getSelection: () => {
+      try {
+        return existsSync(selectionStore.filePath) ? selectionStore.get() : undefined
+      } catch (error) {
+        logger.warn('zcode: selection not readable: %s', describe(error))
+        return undefined
+      }
+    },
   })
 
   ctx.llm.registerAdapter([ZCODE_PROVIDER_ROUTE], adapter)

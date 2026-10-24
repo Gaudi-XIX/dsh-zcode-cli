@@ -121,6 +121,8 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 
 import {
+  DEFAULT_CHANNEL,
+  DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_MODELS,
   DEFAULT_NODE_PATH,
@@ -130,6 +132,9 @@ import {
   filterVisibleModels,
   type Config,
   type ModelConfig,
+  type ZcodeChannel,
+  type ZcodeCredentialChannel,
+  type ZcodeEffort,
   type ZcodeToolPolicy,
 } from './config.js'
 import { ZcodeError, boundDiagnostic, isZcodeError } from './error-codes.js'
@@ -138,6 +143,12 @@ import { FileSessionStore, sessionStorePath } from '../session/file-store.js'
 import { SessionRegistry } from '../session/store.js'
 import { runZcode, type ZcodeProcessConfig } from '../zcode/process.js'
 import { ZcodeStreamParser, parseStdout, type ZcodeFrame, type ZcodeTokenUsage } from '../zcode/parser.js'
+import {
+  mergeHttpMessages,
+  streamZcodeHttp,
+  type ZcodeHttpMessage,
+  type ZcodeHttpUsage,
+} from '../zcode/http-channel.js'
 
 /** Display name of the provider card; the route id is `providerInfo().id`. */
 export const ZCODE_PROVIDER_DISPLAY_NAME = 'ZCode'
@@ -218,6 +229,33 @@ type ZcodeToolFrame = Extract<ZcodeFrame, { kind: 'tool' }>
 type AbortCause = 'caller' | 'tool' | 'in-band-error'
 
 /** Diagnostic sink handed in by the bundle entry (`src/index.ts`). */
+/**
+ * The card's live choice, as the host hands it in.
+ *
+ * Deliberately narrow: the adapter acts on three facts and must not learn the
+ * card's storage layout, so any source that can produce them can drive a turn.
+ * Every field is optional — a partially written choice falls back to the
+ * captured config per field instead of failing the turn.
+ */
+export interface ZcodeLiveSelection {
+  readonly channel?: string | undefined
+  readonly model?: string | undefined
+  readonly effort?: string | undefined
+}
+
+/**
+ * What one turn runs on, resolved from the card and the captured config.
+ *
+ * `channel` still admits `cli` here: the split into an HTTP turn happens in
+ * `stream()`, which narrows it once, so the HTTP path cannot be reached with a
+ * transport it has no business serving.
+ */
+interface ZcodeTurnTransport {
+  readonly channel: ZcodeChannel
+  readonly model: string
+  readonly effort: ZcodeEffort
+}
+
 export interface ZcodeAdapterDeps {
   /** One structured record per event; the entry serializes it to a log line. */
   readonly logger: (record: unknown) => void
@@ -231,6 +269,17 @@ export interface ZcodeAdapterDeps {
    * project).
    */
   readonly resolveWorkspaceRoot?: ((conversationId: string | undefined) => Promise<string | undefined>) | undefined
+  /**
+   * Read the live selection the settings card writes.
+   *
+   * The route policy is captured once and must stay immutable, but the
+   * transport is the user's choice, not a policy: the card has to switch
+   * channel, model and effort on the next turn instead of the next host
+   * restart. Returning `undefined` means "no card has ever written a choice",
+   * which keeps the captured config in charge — an install that never opened
+   * the card behaves exactly like one built without this dependency.
+   */
+  readonly getSelection?: (() => ZcodeLiveSelection | undefined) | undefined
 }
 
 /**
@@ -242,6 +291,38 @@ export interface ZcodeAdapterDeps {
  * registered"), so a settings change can only take effect through a new
  * adapter — never by swapping a policy under an in-flight turn.
  */
+/**
+ * Read a channel id out of the card.
+ *
+ * Anything this adapter cannot route becomes `undefined`, which leaves the
+ * configured channel in charge. Guessing a transport for an unrecognized value
+ * would spend a credential on a channel the user did not pick.
+ */
+function resolveTurnChannel(value: string | undefined): ZcodeChannel | undefined {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  if (normalized === 'free' || normalized === 'paid' || normalized === 'cli') return normalized
+  return undefined
+}
+
+/**
+ * Collapse the card's six efforts onto the four `output_config.effort` accepts.
+ *
+ * `minimal` and `xhigh` are the two values the Messages body does not name, and
+ * both round up to the nearest supported step: reporting the requested value to
+ * the service would either be rejected or silently ignored.
+ */
+function resolveHttpEffort(value: string | undefined): ZcodeEffort | undefined {
+  switch (typeof value === 'string' ? value.trim().toLowerCase() : '') {
+    case 'minimal': return 'low'
+    case 'low': return 'low'
+    case 'medium': return 'medium'
+    case 'high': return 'high'
+    case 'xhigh': return 'max'
+    case 'max': return 'max'
+    default: return undefined
+  }
+}
+
 export class ZcodeAdapter extends LlmAdapter {
   private readonly config: Config
   private readonly logger: (record: unknown) => void
@@ -250,15 +331,18 @@ export class ZcodeAdapter extends LlmAdapter {
   private readonly catalog: readonly ModelConfig[]
   private readonly toolPolicy: ZcodeToolPolicy
   private readonly processConfig: ZcodeProcessConfig
+  private readonly httpChannel: ZcodeCredentialChannel | undefined
   private readonly sessions: SessionRegistry
   private readonly retryPolicy: ResolvedRetryPolicy
   private readonly resolveWorkspaceRoot: ZcodeAdapterDeps['resolveWorkspaceRoot']
+  private readonly getSelection: ZcodeAdapterDeps['getSelection']
 
   constructor(config: Config, deps: ZcodeAdapterDeps) {
     super()
     this.config = config
     this.logger = deps.logger
     this.resolveWorkspaceRoot = deps.resolveWorkspaceRoot
+    this.getSelection = deps.getSelection
     this.provider = nonEmpty(config.provider) ?? 'zcode'
     this.model = nonEmpty(config.model) ?? DEFAULT_MODEL
     // One catalog builder for both the adapter and the test/tool surface: the
@@ -266,6 +350,10 @@ export class ZcodeAdapter extends LlmAdapter {
     // that sets only `model` never fails `resolveModel` with MODEL_NOT_FOUND.
     this.catalog = configuredModels({ model: config.model, models: config.models ?? DEFAULT_MODELS })
     this.toolPolicy = config.toolPolicy ?? 'reject'
+    const channel = config.channel ?? DEFAULT_CHANNEL
+    // `cli` keeps the spawned-process path; the two credential channels speak the
+    // Messages protocol directly and never start a child.
+    this.httpChannel = channel === 'cli' ? undefined : channel
     this.processConfig = {
       nodePath: nonEmpty(config.nodePath) ?? DEFAULT_NODE_PATH,
       zcodeCjsPath: nonEmpty(config.zcodeCjsPath) ?? DEFAULT_ZCODE_CJS_PATH,
@@ -351,6 +439,16 @@ export class ZcodeAdapter extends LlmAdapter {
    * provider facts this adapter collected.
    */
   override async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk, void, void> {
+    // The transport is the user's choice, so it is read once per turn and never
+    // mid-flight; the retry policy stays exactly as captured, because swapping
+    // it under a running request would rewrite the terms the route was
+    // registered with.
+    const transport = this.liveSelection()
+    if (transport.channel !== 'cli') {
+      const channel: ZcodeCredentialChannel = transport.channel
+      yield* this.streamOverHttp(options, channel, transport.model, transport.effort)
+      return
+    }
     const conversationId = options.sessionId === undefined ? undefined : String(options.sessionId)
     const auxiliary = options.purpose !== undefined
     const shared = conversationId !== undefined && !auxiliary
@@ -360,6 +458,221 @@ export class ZcodeAdapter extends LlmAdapter {
     } finally {
       release?.()
     }
+  }
+
+  /**
+   * The transport for one turn: the card's choice when it has written one, else
+   * the config captured when the route was registered.
+   *
+   * Read per turn rather than per adapter, because the card must take effect on
+   * the next turn instead of the next host restart. A source that throws, or a
+   * choice that is half written, never fails a turn: every field falls back to
+   * the captured config on its own, so a selection naming only a channel still
+   * runs on the configured model and effort.
+   */
+  private liveSelection(): ZcodeTurnTransport {
+    let selection: ZcodeLiveSelection | undefined
+    try {
+      selection = this.getSelection?.()
+    } catch (error) {
+      this.logger({
+        kind: 'zcode.selection.read_failed',
+        provider: this.provider,
+        message: error instanceof Error ? error.message : String(error),
+      })
+      selection = undefined
+    }
+    return {
+      channel: resolveTurnChannel(selection?.channel) ?? this.httpChannel ?? 'cli',
+      model: nonEmpty(selection?.model) ?? this.model,
+      effort: resolveHttpEffort(selection?.effort) ?? this.config.effort ?? DEFAULT_EFFORT,
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // HTTP turn
+  // -------------------------------------------------------------------------
+
+  /**
+   * Run one turn against the Messages endpoint instead of a child process.
+   *
+   * The frame order is the same contract the CLI path keeps —
+   * `block-start(text)? → text-delta* → block-end(text)? → usage? → finish` —
+   * so a caller cannot tell the two transports apart from the chunk stream.
+   * What differs is everything the process layer used to own:
+   *
+   * - **No session lock.** The endpoint is stateless: the whole history travels
+   *   in `messages`, so two turns on one conversation have nothing to serialize
+   *   and `sessionMode: 'resume'` is meaningless here.
+   * - **The history is not flattened into one prompt.** Each message keeps its
+   *   role, which is what makes a long conversation cheaper on this channel than
+   *   the `-p` argv path (and why the argv ceiling above does not apply).
+   * - **`temperature`, `maxTokens` and `stop` are honored, not refused.** The
+   *   Messages body has fields for all three; refusing them (as the CLI path
+   *   must, for lack of a channel) would be a downgrade invented by this adapter.
+   * - **Reasoning deltas are observed but not projected.** The CLI path surfaces
+   *   answer text only, and emitting a reasoning block on one channel and not the
+   *   other would make the same turn produce different chunk shapes.
+   *
+   * Like the CLI path, the generator never throws: every failure becomes one
+   * terminal `finish` chunk carrying the DSH-visible code.
+   */
+  private async *streamOverHttp(
+    options: GenerateOptions,
+    channel: ZcodeCredentialChannel,
+    model: string,
+    effort: ZcodeEffort,
+  ): AsyncGenerator<StreamChunk, void, void> {
+    const startedAt = Date.now()
+    let failure: LlmFailure | undefined
+    let usage: TokenUsage | undefined
+    let stopReason: string | undefined
+    let textOpen = false
+    const textParts: string[] = []
+
+    const admission = this.httpAdmissionFailure(options)
+    if (admission !== undefined) {
+      failure = admission
+    } else {
+      try {
+        const messages = toHttpMessages(options.messages)
+        for await (const event of streamZcodeHttp({
+          channel,
+          model,
+          effort,
+          messages,
+          ...(messages.length === 0 || options.system === undefined || options.system.trim().length === 0
+            ? {}
+            : { system: [options.system] }),
+          ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
+          ...(options.temperature === undefined ? {} : { temperature: options.temperature }),
+          ...(options.stop === undefined || options.stop.length === 0 ? {} : { stop: options.stop }),
+          timeoutMs: this.processConfig.timeoutMs,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        })) {
+          switch (event.type) {
+            case 'text': {
+              if (!textOpen) {
+                textOpen = true
+                yield { type: 'block-start', index: 0, blockType: 'text' }
+              }
+              textParts.push(event.text)
+              yield { type: 'text-delta', index: 0, text: event.text }
+              break
+            }
+            case 'usage': {
+              // Successive usage events are cumulative snapshots, so the last one
+              // is the turn's reading; earlier ones are already superseded.
+              usage = toHttpTokenUsage(event.usage)
+              break
+            }
+            case 'stop': {
+              if (event.reason !== undefined) stopReason = event.reason
+              break
+            }
+            default: {
+              // `thinking`: dropped on purpose, see the note above.
+              break
+            }
+          }
+        }
+      } catch (error) {
+        failure = this.httpFailure(error)
+      }
+    }
+
+    if (textOpen) {
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: textParts.join('') } }
+    }
+
+    if (failure === undefined) {
+      if (textParts.join('').trim().length === 0) {
+        // Same rule as the CLI path: an empty answer is a failure, never a quiet
+        // success the loop would treat as a completed turn.
+        failure = { code: EMPTY_RESPONSE_CODE, message: 'ZCode returned no answer text over the Messages endpoint' }
+      } else if (isToolStopReason(stopReason)) {
+        failure = {
+          code: 'UNSUPPORTED_TOOLS',
+          message: `ZCode stopped with "${String(stopReason)}", which this route cannot project: `
+            + 'tool execution is not part of the v1 tool policy.',
+        }
+      }
+    }
+
+    this.logger({
+      kind: failure === undefined ? 'zcode.request.completed' : 'zcode.request.failed',
+      provider: this.provider,
+      model,
+      channel,
+      toolPolicy: this.toolPolicy,
+      purpose: options.purpose,
+      durationMs: Date.now() - startedAt,
+      characters: textParts.join('').length,
+      stopReason,
+      code: failure?.code,
+      toolSchemas: options.tools?.length ?? 0,
+      usage,
+    })
+
+    if (usage !== undefined) yield { type: 'usage', usage }
+    yield {
+      type: 'finish',
+      reason: failure === undefined ? stopFinishReason(stopReason) : { kind: 'error', failure },
+    }
+  }
+
+  /**
+   * What this transport refuses before opening a socket.
+   *
+   * The tool rule is the CLI rule: `reject` and `dsh-owned` promise a tool
+   * surface this route cannot deliver, so a request carrying schemas fails
+   * instead of silently running without them. `zcode-owned` proceeds with no
+   * schemas sent — whether the service runs its own tools behind the Messages
+   * endpoint is unverified, and the captured request carried no `tools` key
+   * either, so nothing here may claim more than that.
+   *
+   * `temperature`, `maxTokens` and `stop` are absent from this list on purpose:
+   * the body has fields for them.
+   */
+  private httpAdmissionFailure(options: GenerateOptions): LlmFailure | undefined {
+    const toolCount = options.tools?.length ?? 0
+    if (toolCount > 0 && this.toolPolicy !== 'zcode-owned') {
+      return this.toolPolicy === 'dsh-owned'
+        ? {
+            code: 'UNSUPPORTED_TOOLS',
+            message: `toolPolicy "dsh-owned" is not implemented: this version does not project tool-use blocks from the `
+              + `Messages endpoint back to DSH, so ${toolCount} declared tool(s) cannot be honored. `
+              + 'Use "zcode-owned" (schemas dropped) or "reject" (no tools).',
+          }
+        : {
+            code: 'UNSUPPORTED_TOOLS',
+            message: `toolPolicy "reject" refuses ${toolCount} declared tool schema(s) before the request opens: `
+              + 'this route cannot project tool calls back to DSH, and advertising them anyway would spend a '
+              + 'turn on tools nobody can run. Use "zcode-owned" or remove the tools from the request.',
+          }
+    }
+    if (this.toolPolicy === 'reject') {
+      const media = countMediaBlocks(options.messages)
+      if (media > 0) {
+        return {
+          code: 'UNSUPPORTED_CONTENT',
+          message: `toolPolicy "reject" refuses ${media} image/file block(s) before the request opens: `
+            + 'this route projects attachments to placeholder text, and dropping them silently would answer a '
+            + 'different question. Use "zcode-owned" or "dsh-owned" to receive placeholder text instead.',
+        }
+      }
+    }
+    return undefined
+  }
+
+  /** Classify a thrown HTTP failure into the DSH failure shape. */
+  private httpFailure(error: unknown): LlmFailure {
+    if (isZcodeError(error)) {
+      this.noteQuotaObservation(error)
+      return toLlmFailure(error)
+    }
+    const message = error instanceof Error ? error.message : String(error)
+    return { code: 'ZCODE_UNKNOWN', message: boundDiagnostic(`ZCode Messages request failed: ${message}`) }
   }
 
   // -------------------------------------------------------------------------
@@ -948,9 +1261,59 @@ function renderContent(content: readonly ContentBlock[]): string {
   return parts.join('\n')
 }
 
-/** Project one parsed usage frame onto the disjoint DSH counters. */
-function toTokenUsage(usage: ZcodeTokenUsage): TokenUsage {
+/**
+ * Project the DSH transcript onto the `messages` array of a Messages request.
+ *
+ * Roles survive where the endpoint has one: `assistant` stays `assistant`,
+ * everything else (user, system, developer, tool) becomes `user`. A message that
+ * was not plain user speech keeps the same heading the CLI path prints, because
+ * an unlabelled system instruction or tool result read as user speech asks a
+ * different question than the one DSH recorded.
+ *
+ * A transcript that would open with an assistant turn fails closed instead of
+ * being rewritten into user speech: nothing here may invent a role the history
+ * does not have.
+ */
+export function toHttpMessages(messages: readonly RequestMessage[]): readonly ZcodeHttpMessage[] {
+  const projected: ZcodeHttpMessage[] = []
+  for (const message of messages) {
+    const body = renderContent(message.content).trim()
+    if (body.length === 0) continue
+    const role = message.role === 'assistant' ? 'assistant' : 'user'
+    const content = message.role === 'user' || message.role === 'assistant'
+      ? body
+      : `${roleHeading(message)}:\n${body}`
+    projected.push({ role, content })
+  }
+  const merged = mergeHttpMessages(projected)
+  if (merged[0]?.role === 'assistant') {
+    throw new ZcodeError(
+      'UNSUPPORTED_CONTENT',
+      'The transcript would open with an assistant turn, which the Messages endpoint rejects. '
+        + 'This adapter will not relabel history to make the request succeed.',
+    )
+  }
+  return merged
+}
+
+/**
+ * Project one Messages usage reading onto the DSH counters.
+ *
+ * `input_tokens` and the two cache fields are disjoint in the Messages protocol,
+ * exactly like the CLI's usage frames, so they map straight across and are left
+ * for the consumer to total.
+ */
+function toHttpTokenUsage(usage: ZcodeHttpUsage): TokenUsage {
   return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    ...(usage.cacheReadTokens === 0 ? {} : { cacheReadTokens: usage.cacheReadTokens }),
+    ...(usage.cacheWriteTokens === 0 ? {} : { cacheWriteTokens: usage.cacheWriteTokens }),
+  }
+}
+
+/** Project one parsed usage frame onto the disjoint DSH counters. */
+function toTokenUsage(usage: ZcodeTokenUsage): TokenUsage {  return {
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
     ...(usage.totalTokens === undefined ? {} : { totalTokens: usage.totalTokens }),

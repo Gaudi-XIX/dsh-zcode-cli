@@ -48,6 +48,26 @@ export const ZCODE_ERROR_CODES = [
   'ZCODE_OUTPUT_TOO_LARGE',
   /** The host could not resolve a workspace root for the session; nothing was spawned. */
   'WORKSPACE_UNAVAILABLE',
+  /** The ZCode credential store is absent; the billing panel has nothing to read. */
+  'ZCODE_CREDENTIAL_MISSING',
+  /** The credential store exists but cannot be understood (bad JSON, no token field). */
+  'ZCODE_CREDENTIAL_INVALID',
+  /** AES-256-GCM refused the stored token: wrong secret, truncated payload, tampered tag. */
+  'ZCODE_CREDENTIAL_DECRYPT_FAILED',
+  /** The billing endpoint rejected the identity (HTTP 401/403). */
+  'ZCODE_BILLING_UNAUTHORIZED',
+  /** The billing endpoint rejected the request shape (HTTP 400 / provider code 3001). */
+  'ZCODE_BILLING_BAD_REQUEST',
+  /** The billing endpoint answered with an unexpected status or business code. */
+  'ZCODE_BILLING_HTTP',
+  /** The billing payload did not have the documented shape; nothing was guessed. */
+  'ZCODE_BILLING_PARSE',
+  /**
+   * The Messages endpoint answered with a status this provider has no more
+   * specific rule for (an unclassified 4xx): the request shape or the channel
+   * binding is wrong, and another attempt would fail the same way.
+   */
+  'ZCODE_HTTP',
 ] as const
 
 export type ZcodeErrorCode = typeof ZCODE_ERROR_CODES[number]
