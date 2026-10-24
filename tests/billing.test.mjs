@@ -584,13 +584,16 @@ test('A2: GET /state exposes the frozen contract', async () => {
   await withServer(baseDeps(), async (server) => {
     const response = await request(server, ZCODE_STATE_ROUTE_PATH)
     assert.equal(response.status, 200)
-    assert.equal(response.body.channel, 'free')
-    assert.equal(response.body.model, 'GLM-5.3-Flash')
-    assert.equal(response.body.effort, 'medium')
-    assert.deepEqual(response.body.models.map((m) => m.id), DEFAULT_MODELS.map((m) => m.id))
-    assert.deepEqual(response.body.efforts.map((e) => e.id), ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
-    assert.deepEqual(response.body.channels.map((c) => c.id), ['free', 'paid', 'cli'])
-    assert.equal(response.body.channels.every((c) => c.available === true), true)
+    // One envelope for both verbs: the card parses `{ ok, state }` and would
+    // read a flat body as STATE_UNAVAILABLE, blanking its controls.
+    assert.equal(response.body.ok, true)
+    assert.equal(response.body.state.channel, 'free')
+    assert.equal(response.body.state.model, 'GLM-5.3-Flash')
+    assert.equal(response.body.state.effort, 'medium')
+    assert.deepEqual(response.body.state.models.map((m) => m.id), DEFAULT_MODELS.map((m) => m.id))
+    assert.deepEqual(response.body.state.efforts.map((e) => e.id), ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+    assert.deepEqual(response.body.state.channels.map((c) => c.id), ['free', 'paid', 'cli'])
+    assert.equal(response.body.state.channels.every((c) => c.available === true), true)
   })
 })
 

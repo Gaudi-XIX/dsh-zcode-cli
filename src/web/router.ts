@@ -485,7 +485,9 @@ export function createZcodeWebRoutes(deps: ZcodeWebRoutesDeps): ZcodeWebRoutes {
     }
     if (req.method === 'GET') {
       try {
-        sendRouteJson(res, 200, buildState(deps))
+        // Same envelope as POST: the card parses one shape for both verbs, so a
+        // flat GET body would read as STATE_UNAVAILABLE and blank the controls.
+        sendRouteJson(res, 200, { ok: true, state: buildState(deps) })
       } catch (error) {
         sendRouteJson(res, 500, { ok: false, error: 'STATE_UNAVAILABLE', detail: sanitizeSecrets(describe(error)) })
       }
