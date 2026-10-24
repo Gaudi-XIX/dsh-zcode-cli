@@ -189,7 +189,17 @@ test('the free channel reads the encrypted store and binds the device id', async
     const auth = await resolveZcodeHttpAuth(freeRequest(root))
     assert.equal(auth.deviceMid, TEST_DEVICE)
     assert.equal(auth.headers['authorization'], `Bearer ${TEST_JWT}`)
-    assert.equal(auth.headers['x-device-mid'], TEST_DEVICE)
+    // The Messages request is byte-shaped like the captured CLI: the device id
+    // travels inside `metadata.user_id`, never as its own header, and the
+    // fingerprint headers the endpoint's risk control looks for are present.
+    assert.equal(auth.headers['x-device-mid'], undefined)
+    assert.match(auth.headers['user-agent'], /^ZCode\/0\.17\.0 ai-sdk\/provider-utils\/4\.0\.27 runtime\/node\.js\/\d+$/)
+    assert.equal(auth.headers['x-zcode-agent'], 'glm')
+    assert.equal(auth.headers['x-zcode-query-source'], 'main_turn')
+    assert.equal(auth.headers['x-zcode-session-type'], 'main')
+    assert.equal(auth.headers['x-session-id'], auth.sessionUuid)
+    assert.match(auth.sessionUuid, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$/)
+    assert.match(auth.headers['x-request-id'], /^[0-9a-f-]{36}$/)
     assert.equal(auth.headers['anthropic-version'], ZCODE_ANTHROPIC_VERSION)
     assert.equal(auth.headers['x-title'], 'Z Code@cli')
     assert.equal(auth.url, `${ZCODE_FREE_BASE_URL}/v1/messages`)
@@ -614,7 +624,8 @@ test('the free channel streams text with the CLI frame order', async (t) => {
 
   assert.equal(calls.length, 1)
   assert.equal(calls[0].url, `${ZCODE_FREE_BASE_URL}/v1/messages`)
-  assert.equal(calls[0].init.headers['x-device-mid'], TEST_DEVICE)
+  assert.equal(calls[0].init.headers['x-device-mid'], undefined)
+  assert.equal(JSON.parse(calls[0].body.metadata.user_id).session_id, calls[0].init.headers['x-session-id'])
   assert.equal(calls[0].body.model, 'GLM-5.3-Flash')
   assert.equal(calls[0].body.messages.length, 1)
   assert.deepEqual(calls[0].body.messages[0], { role: 'user', content: [{ type: 'text', text: 'hello there' }] })

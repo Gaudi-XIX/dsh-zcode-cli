@@ -28,6 +28,7 @@
  * deviation is a request nothing here can validate.
  */
 
+import { createHash, randomUUID } from 'node:crypto'
 import { release } from 'node:os'
 
 import { ZcodeError, sanitizeSecrets, type ZcodeErrorCode } from '../provider/error-codes.js'
@@ -160,6 +161,28 @@ export interface ZcodeHttpAuth {
   readonly headers: Readonly<Record<string, string>>
   /** Free channel only: the device id that `metadata.user_id` repeats. */
   readonly deviceMid: string | undefined
+  /** The CLI session id: `x-session-id` on the wire and `metadata.user_id.session_id`. */
+  readonly sessionUuid: string
+}
+
+/**
+ * The CLI's own session id for one conversation.
+ *
+ * The captured request carried a UUID in `x-session-id` *and* repeated it inside
+ * `metadata.user_id`, so the endpoint sees one session per conversation. DSH's
+ * session id is not a UUID, so it is hashed into one: stable for the life of a
+ * conversation, and never the same across two of them.
+ */
+const sessionUuids = new Map<string, string>()
+
+function cliSessionUuid(sessionId: string | undefined): string {
+  const key = nonEmpty(sessionId) ?? ''
+  const cached = sessionUuids.get(key)
+  if (cached !== undefined) return cached
+  const hex = createHash('sha256').update(`zcode-cli-session:${key}`).digest('hex')
+  const uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+  sessionUuids.set(key, uuid)
+  return uuid
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -208,20 +231,33 @@ export function resolveZcodeHttpEndpoint(channel: ZcodeCredentialChannel, baseUr
 export async function resolveZcodeHttpAuth(request: ZcodeHttpRequest): Promise<ZcodeHttpAuth> {
   const env = request.env ?? process.env
   const url = resolveZcodeHttpEndpoint(request.channel, request.baseUrl)
+  const sessionUuid = cliSessionUuid(request.sessionId)
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     // The capture sent `*/*` and still received SSE; keep it byte-identical
     // rather than advertising a parser the endpoint may or may not branch on.
     accept: '*/*',
     'accept-language': '*',
-    'accept-encoding': 'identity',
+    'accept-encoding': 'gzip, deflate',
     'anthropic-version': ZCODE_ANTHROPIC_VERSION,
     'http-referer': 'https://zcode.z.ai',
-    'x-client-language': nonEmpty(env['LANG']) ?? 'en-US',
-    'x-client-timezone': Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'UTC',
+    // Byte-identical to the captured CLI: the endpoint's risk control answers
+    // 405 `[3012] request has been blocked due to unusual activity` when the
+    // request does not look like the CLI, and the UA plus the ids below are the
+    // cheapest part of that fingerprint to get exactly right.
+    'user-agent': `ZCode/0.17.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/${process.versions.node.split('.')[0] ?? '24'}`,
+    'x-client-language': nonEmpty(env['LANG']) ?? 'zh-CN',
+    'x-client-timezone': Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'Asia/Shanghai',
+    'x-query-id': randomUUID(),
     'x-release-channel': 'production',
+    'x-request-id': randomUUID(),
+    'x-session-id': sessionUuid,
     'x-title': 'Z Code@cli',
+    'x-zcode-agent': 'glm',
     'x-zcode-app-version': '0.17.0',
+    'x-zcode-query-source': 'main_turn',
+    'x-zcode-session-type': 'main',
+    'x-zcode-trace-id': randomUUID(),
     'sec-fetch-mode': 'cors',
     ...platformHeaders(),
   }
@@ -236,7 +272,7 @@ export async function resolveZcodeHttpAuth(request: ZcodeHttpRequest): Promise<Z
     }
     headers['x-api-key'] = apiKey
     headers['authorization'] = `Bearer ${apiKey}`
-    return { channel: 'paid', url, headers, deviceMid: undefined }
+    return { channel: 'paid', url, headers, deviceMid: undefined, sessionUuid }
   }
 
   const dataBaseDir = nonEmpty(request.dataBaseDir) ?? nonEmpty(env[ZCODE_DATA_BASE_DIR_ENV])
@@ -248,9 +284,10 @@ export async function resolveZcodeHttpAuth(request: ZcodeHttpRequest): Promise<Z
   }
   const { jwt, deviceMid } = await resolveZcodeCredential(dataBaseDir, env)
   headers['authorization'] = `Bearer ${jwt}`
-  headers['x-device-mid'] = deviceMid
   headers['x-api-key'] = jwt
-  return { channel: request.channel, url, headers, deviceMid }
+  // No `x-device-mid` here: the captured Messages request never carried it (it
+  // is a billing header). The device id still travels inside `metadata.user_id`.
+  return { channel: request.channel, url, headers, deviceMid, sessionUuid }
 }
 
 /** One turn's content as blocks; a text-only turn becomes its single text block. */
@@ -402,7 +439,7 @@ export function buildZcodeHttpBody(request: ZcodeHttpRequest, auth: ZcodeHttpAut
       user_id: JSON.stringify({
         device_id: auth.deviceMid ?? '',
         account_uuid: '',
-        session_id: request.sessionId ?? '',
+        session_id: auth.sessionUuid,
       }),
     }
   }

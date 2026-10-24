@@ -46,7 +46,13 @@ export interface ZcodeSelectionPatch {
 
 /** Used when the file is missing, unreadable or carries an unknown value. */
 export const ZCODE_DEFAULT_SELECTION: ZcodeSelectionState = Object.freeze({
-  channel: 'free',
+  // `cli` is the default because it is the only transport where the official
+  // binary signs its own requests. The direct HTTP channels replay the CLI's
+  // request shape, and ZCode's risk control answers `405 [3012] request has
+  // been blocked due to unusual activity` once it decides the caller is not the
+  // CLI — observed on this account after a handful of turns, with time-based
+  // penalties. So HTTP stays selectable, but never the default.
+  channel: 'cli',
   model: 'GLM-5.3-Flash',
   effort: 'max',
 })
