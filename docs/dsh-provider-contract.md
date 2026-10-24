@@ -226,15 +226,25 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 2. 环境变量可保留：它们只是 ZCode CLI 需要的宿主配置，删掉会让 ZCode 本体也起不来；确需删除时按 `install-env.ps1` 输出的键名逐个 `[Environment]::SetEnvironmentVariable(name, $null, 'User')`。
 3. 重启 DSH。
 
+## 浏览器端卡片（client half）
+
+宿主给「设置 → 模型」里每个 provider 行渲染槽 `settings.models.provider-card`，槽位**没有回退表单**：找不到与 `entryKey` 匹配的卡片时行体就是空的。所以本包必须带一个浏览器半边，否则后端再正常，设置页里 ZCode 那一行也是空白。
+
+- 入口：`client/index.ts`（源码）→ `scripts/build-client.mjs`（TypeScript 编译器 API 打包）→ `dist/client.js`（单文件 ESM，`dist/` 被 gitignore，门禁构建它）。`package.json` 声明 `dsh.client = { inject: ['@deepseek-ai/dsh-client-ui-primitives'], platform: 'web' }` 与 `exports['./client']`。
+- 槽键：`ctx.slots.register({ name: 'settings.models.provider-card', key: 'dsh-zcode-provider', id: 'zcode-provider-card' }, …)`。`key` 必须**逐字等于** Node 半边的 `ZCODE_SETTINGS_NS`（`src/index.ts`），宿主按这个字符串匹配，写错一个字符就回到空白行。
+- 槽位 props 只有 `{ provider, configured, keyConfigured }`，**不含配置本体**（配置在同一个槽的兄弟表单里）。因此卡片是**只读信息面板**，显示的是随包发布的默认值（模型目录、`sessionMode` / `toolPolicy` / `mode` / `imageInput`、CLI 入口、环境契约、1309 说明），不是用户当前编辑中的值；面板里明确写了「以编辑表单为准」。没有 web 路由，卡片不发任何请求。
+- Hook 纪律：`useState` / `useEffect` 只在组件上方的 `useTranslation()` 里，组件函数体**唯一一句 hook 在首行、只有一个 return**。宿主用 `SlotErrorBoundary` 包住槽内容，渲染期抛异常会渲染成空元素——hook 在条件 return 之后导致 hook 数变化时，症状与本次修的空白行一模一样。`tests/client.test.mjs` 把这条结构钉住。
+- 漂移防线：卡片不能 import `src/provider/config.ts`（会拖入 schemastery 与适配器模块图，浏览器侧无法解析），所以模型目录、默认值与环境契约是**手抄字面量**；`tests/client.test.mjs` 逐项与 `src/` 和 `cordis.patch.yml` 比对，任一侧改了没同步就判红。
+
 ## 门禁
 
-`node scripts/run-tests.mjs` 是唯一入口，顺序固定：AC11（`src/`、`tests/`、`scripts/`、`docs/` 与根级文本文件全部 LF、无 BOM）→ `tsc --noEmit` → `tsc`（build）→ 包入口点（`main` / `types` / `exports` / `dsh.bundle.patch` 指向的文件存在，且 `dependencies` 为空）→ 测试面计数 → `node --test` → 用例数核对。
+`node scripts/run-tests.mjs` 是唯一入口，顺序固定：AC11（`client/`、`src/`、`tests/`、`scripts/`、`docs/` 与根级文本文件全部 LF、无 BOM）→ `tsc --noEmit` → `tsc`（build）→ `tsc -p tsconfig.client.json`（浏览器半边类型检查）→ `node scripts/build-client.mjs`（生成 `dist/client.js`）→ 包入口点（`main` / `types` / `exports` / `dsh.bundle.patch` 指向的文件存在，且 `dependencies` 为空）→ 测试面计数 → `node --test` → 用例数核对。`dist/client.js` 由门禁现建：它是 `exports['./client']` 的目标，且 `dist/` 不纳管，干净检出时不存在。
 
-测试面：`tests/` 下递归共 **9** 个 `*.test.mjs`，必须与脚本里的 `EXPECTED_TEST_FILES` 集合相等，也必须等于本行声明的数字（`declaredTestCount()` 解析本行）。少一个、多一个、改名一个都会让门禁在跑测试前就停——不允许「测试变少、门禁仍绿」。
+测试面：`tests/` 下递归共 **10** 个 `*.test.mjs`，必须与脚本里的 `EXPECTED_TEST_FILES` 集合相等，也必须等于本行声明的数字（`declaredTestCount()` 解析本行）。少一个、多一个、改名一个都会让门禁在跑测试前就停——不允许「测试变少、门禁仍绿」。
 
-测试用例：`node --test` 汇总的用例总数共 **131** 个（`ℹ tests 131`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
+测试用例：`node --test` 汇总的用例总数共 **135** 个（`ℹ tests 135`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
 
-受控文件：`git ls-files` 共 **27** 个 = 10 个 `src/**` 源文件（`index.ts`、`diagnostics.ts`、`doctor.ts`、`provider/{config,error-codes,zcode}.ts`、`session/{file-store,store}.ts`、`zcode/{parser,process}.ts`）+ 9 个 `tests/**/*.test.mjs` + 2 个 `scripts/`（`run-tests.mjs`、`install-env.ps1`）+ 1 个 `docs/dsh-provider-contract.md` + 5 个根级文件（`.gitignore`、`README.md`、`cordis.patch.yml`、`package.json`、`tsconfig.json`）。门禁会拿 `git ls-files` 的实点数与这一行比对，改文件数必须同步改这行。
+受控文件：`git ls-files` 共 **32** 个 = 10 个 `src/**` 源文件（`index.ts`、`diagnostics.ts`、`doctor.ts`、`provider/{config,error-codes,zcode}.ts`、`session/{file-store,store}.ts`、`zcode/{parser,process}.ts`）+ 2 个 `client/` 源文件（`index.ts`、`locales.ts`）+ 10 个 `tests/**/*.test.mjs` + 3 个 `scripts/`（`run-tests.mjs`、`build-client.mjs`、`install-env.ps1`）+ 1 个 `docs/dsh-provider-contract.md` + 6 个根级文件（`.gitignore`、`README.md`、`cordis.patch.yml`、`package.json`、`tsconfig.json`、`tsconfig.client.json`）。门禁会拿 `git ls-files` 的实点数与这一行比对，改文件数必须同步改这行。
 
 ## 已知限制
 

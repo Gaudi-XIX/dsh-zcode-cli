@@ -48,9 +48,9 @@ if (!existsSync(tsc)) {
 }
 
 /** Directories whose text files AC11 covers. */
-const TEXT_ROOTS = ['src', 'tests', 'scripts', 'docs']
+const TEXT_ROOTS = ['client', 'src', 'tests', 'scripts', 'docs']
 /** Root-level text files AC11 covers, when present. */
-const TEXT_FILES = ['package.json', 'tsconfig.json', 'README.md', 'cordis.patch.yml']
+const TEXT_FILES = ['package.json', 'tsconfig.client.json', 'tsconfig.json', 'README.md', 'cordis.patch.yml']
 /** Extensions treated as text. */
 const TEXT_EXTENSIONS = ['.ts', '.mjs', '.js', '.json', '.md', '.yml']
 
@@ -65,6 +65,7 @@ const TEXT_EXTENSIONS = ['.ts', '.mjs', '.js', '.json', '.md', '.yml']
 const EXPECTED_TEST_FILES = [
   'adapter.test.mjs',
   'argv.test.mjs',
+  'client.test.mjs',
   'doctor.test.mjs',
   'env.test.mjs',
   'error-codes.test.mjs',
@@ -83,7 +84,7 @@ const EXPECTED_TEST_FILES = [
  * `docs/dsh-provider-contract.md` and with the summary `node --test` prints.
  * Adding or removing a case means updating all three.
  */
-const EXPECTED_TEST_CASES = 131
+const EXPECTED_TEST_CASES = 135
 
 /**
  * Recursively collect `*.test.mjs` under the tests directory.
@@ -302,6 +303,16 @@ process.stdout.write('  all text files are LF without BOM\n')
 // would otherwise be buried in.
 if (!step('typecheck', [tsc, '-p', 'tsconfig.json', '--noEmit'])) process.exit(1)
 if (!step('build', [tsc, '-p', 'tsconfig.json'])) process.exit(1)
+// The browser half has its own project: `client/` may not import `src/` (the
+// Node half pulls in schemastery and the adapter module graph, which a web
+// bundle cannot resolve). Without this step nothing checks it at all — `tsc -p
+// tsconfig.json` only sees `src`, so a type error would ship and the host's
+// SlotErrorBoundary would blank the settings row instead of reporting it.
+if (!step('typecheck:client', [tsc, '-p', 'tsconfig.client.json'])) process.exit(1)
+// `dist/` is gitignored, so a clean checkout has no bundle. The manifest exports
+// `./dist/client.js` and the entry-point check below requires the target to
+// exist: build it here rather than assuming a previous local build is present.
+if (!step('build:client', ['scripts/build-client.mjs'])) process.exit(1)
 
 process.stdout.write('\n── package entry points\n')
 const entryProblems = findBrokenEntryPoints()

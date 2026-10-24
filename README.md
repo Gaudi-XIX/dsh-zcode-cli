@@ -12,6 +12,8 @@ DSH 的 ZCode provider：把本机 `zcode.cjs`（ZCode 0.17.0）作为一个 `zc
 
 不做什么：不做模型发现（ZCode 没有免配额的模型列表）、不猜计费、不判套餐权益、不伪造 sessionId。
 
+浏览器半边：`client/` 往 `settings.models.provider-card` 槽注册一张只读卡片（`key` 逐字等于 `ZCODE_SETTINGS_NS`，否则设置页里本行是空白——槽位没有回退表单）。卡片只显示随包发布的默认值与环境契约，不读也不写宿主配置、不发请求。构建物 `dist/client.js` 被 gitignore，由门禁现建。
+
 ## 安装
 
 1. `pwsh -File scripts/install-env.ps1` 看 dry-run，确认后 `pwsh -File scripts/install-env.ps1 -Apply`（已存在且不同的变量默认跳过，需 `-Force` 覆盖）。
@@ -23,10 +25,10 @@ DSH 的 ZCode provider：把本机 `zcode.cjs`（ZCode 0.17.0）作为一个 `zc
 ## 门禁
 
 ```bash
-node scripts/run-tests.mjs    # AC11 行尾 → tsc --noEmit → build → 包入口点 → 测试面计数 → node --test
+node scripts/run-tests.mjs    # AC11 行尾 → tsc --noEmit → build → tsc client → build:client → 包入口点 → 测试面计数 → node --test
 ```
 
-`tests/` 下 9 个 `*.test.mjs`；脚本里的显式清单、`docs/dsh-provider-contract.md` 的「测试面」计数与磁盘实点三者必须一致，否则门禁在跑测试前就停。用例总数同样锁死（`EXPECTED_TEST_CASES` 与文档「测试用例」行），删掉一个 `test()` 块也会让门禁变红。
+`tests/` 下 10 个 `*.test.mjs`；脚本里的显式清单、`docs/dsh-provider-contract.md` 的「测试面」计数与磁盘实点三者必须一致，否则门禁在跑测试前就停。用例总数同样锁死（135，`EXPECTED_TEST_CASES` 与文档「测试用例」行），删掉一个 `test()` 块也会让门禁变红。
 
 ## 已知限制（摘要）
 
