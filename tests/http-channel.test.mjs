@@ -48,8 +48,11 @@ const TEST_JWT = 'jwt-header.payload.signature'
 const TEST_DEVICE = 'device-mid-from-telemetry'
 
 function encryptValue(value, secret) {
-  // The store format uses a 16-byte IV and a 16-byte GCM tag (billing.ts).
-  const iv = Buffer.alloc(16, 7)
+  // Mirror the store format exactly: 12-byte IV and 16-byte GCM tag
+  // (`GCM_IV_BYTES` / `GCM_TAG_BYTES` in src/zcode/billing.ts), key =
+  // sha256(secret). A fixture that drifts from the store fails closed, which is
+  // the behaviour under test here.
+  const iv = Buffer.alloc(12, 7)
   const key = createHash('sha256').update(secret, 'utf8').digest()
   const cipher = createCipheriv('aes-256-gcm', key, iv)
   const data = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()])

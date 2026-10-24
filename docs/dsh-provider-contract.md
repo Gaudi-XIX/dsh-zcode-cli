@@ -66,9 +66,23 @@ class ZcodeAdapter extends LlmAdapter {
 `GenerateOptions` 是 DSH 已组装的无提供方请求：`provider`、`model`、`messages`、`system`、`tools`、`temperature`、`maxTokens`、`stop`、`reasoningEffort`、`signal`、`sessionId`、`purpose`。
 
 - `signal` 必须尊重：取消即终止子进程，映射为 `ABORTED`。
-- 不支持的字段不能静默丢弃，必须抛带稳定 code 的 `ZcodeError`。默认 `toolPolicy: reject` 下，非空 `tools` 报 `UNSUPPORTED_TOOLS`，`temperature` / `maxTokens` / 非空 `stop` 报 `UNSUPPORTED_OPTION`，image/file block 报 `UNSUPPORTED_CONTENT`——全部在 spawn 之前。
+- 不支持的字段不能静默丢弃，必须抛带稳定 code 的 `ZcodeError`。默认 `toolPolicy: reject` 下，非空 `tools` 报 `UNSUPPORTED_TOOLS`，image/file block 报 `UNSUPPORTED_CONTENT`——两条在 spawn 之前生效（`channel: cli`）或在开 socket 之前生效（`channel: free|paid`）。`temperature` / `maxTokens` / 非空 `stop` **只在 `channel: cli`** 报 `UNSUPPORTED_OPTION`：CLI 的 `-p` 协议没有这三个字段的入口；两个 HTTP 通道把它们原样放进请求体（见「传输通道」）。
 - `toolPolicy: zcode-owned` 丢弃 DSH 的工具 schema 后继续；`dsh-owned` 拒绝 tools（投影 tool call 需要本版不产出的分片）。两种宽松策略下 image/file 投影为占位文本（`[图片附件 … 图片内容未发送]`），不静默丢失。
-- ZCode 的单次 `-p` 协议没有 reasoning effort 通道，`reasoningEffort` 不做映射，也不假装支持。
+- `reasoningEffort` 不映射到 CLI（`-p` 协议没有该通道）；HTTP 通道把它放进 `output_config.effort`，取值 `low|medium|high|max`，缺省 `high`。
+
+## 传输通道（channel）
+
+`config.channel` 三选一，缺省 `cli`；浏览器端卡片选择在下一次请求生效（`resolveTurnChannel()`），无法识别的值回落到注册时捕获的 `channel`，**不猜传输方式**——猜错会花掉一个用户没选的凭据。
+
+| 通道 | 传输 | 凭据来源 | 端点 |
+|---|---|---|---|
+| `cli` | spawn `zcode.cjs -p … --mode guarded --json` | 由 CLI 自己管 | 本机进程 |
+| `free` | HTTP，Anthropic Messages 形状的流式 SSE | ZCode CLI 登录态：`<ZCODE_DATA_BASE_DIR>/.zcode/v2/credentials.json` 的 `zcodejwttoken`（`enc:v1:` AES-256-GCM，12 字节 IV + 16 字节 tag，密钥 = `sha256(ZCODE_CREDENTIAL_SECRET)`，变量缺省时用本机回落串）+ `telemetry-state.json` 的 `deviceMid`（`x-device-mid`） | `https://zcode.z.ai/api/v1/zcode-plan/anthropic` + `/v1/messages` |
+| `paid` | 同上 | 只从环境读 `ZCODE_PAID_API_KEY`；**不读配置文件**，`config.apiKey` 不接受 | `config.paidBaseUrl`（缺省 `https://open.bigmodel.cn/api/anthropic`）+ `/v1/messages` |
+
+请求体的字段是本机抓包（`F:\AgentData\.agents\flow\tmp\zc-capture.json`，123 KB，一次真实 free 通道请求的完整请求体与 SSE 响应）逐字段对出来的：`model`、`max_tokens`（缺省 `128000`）、`system`（prefix 块 + 调用方 system）、`messages`（`user`/`assistant` 两角色，system/工具等非对话轮折进 `user` 并在正文前加角色标题）、`thinking: {type: 'enabled'}`、`output_config.effort`、`stream: true`；`temperature` 与 `stop_sequences` 只在调用方设置时才出现。`free` 通道额外带 `metadata.user_id`（`device_id` = `deviceMid`、`session_id` = 会话 id），`paid` 通道不带——它没有设备与会话绑定，发一个空 `device_id` 等于声明一件本适配器无法背书的事。
+
+失败映射：非 2xx 按状态码与响应体分派到 `ZCODE_HTTP` 一族（`ZCODE_CREDENTIAL_*`、`ZCODE_BILLING_*` 由各自的模块产出），SSE 里的 tool 停止原因按 `toolPolicy` 判 `UNSUPPORTED_TOOLS`；HTTP 通道的默认墙钟上限 `900000` ms（`ZCODE_HTTP_DEFAULT_TIMEOUT_MS`），失败诊断里回显的响应体截到 `512` 字符（`ZCODE_HTTP_BODY_SNIPPET_MAX_CHARS`）。
 
 ## StreamChunk 顺序
 
