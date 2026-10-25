@@ -139,6 +139,7 @@ import {
   type ZcodeToolPolicy,
 } from './config.js'
 import { ZcodeError, boundDiagnostic, isZcodeError, isZcodeErrorCode } from './error-codes.js'
+import { appendFileSync } from 'node:fs'
 import { QUOTA_PROVIDER_CODE, recordQuotaObservation } from '../diagnostics.js'
 import { FileSessionStore, sessionStorePath } from '../session/file-store.js'
 import { SessionRegistry } from '../session/store.js'
@@ -296,7 +297,7 @@ export class ZcodeAdapter extends LlmAdapter {
   constructor(config: Config, deps: ZcodeAdapterDeps) {
     super()
     this.config = config
-    this.logger = deps.logger
+    this.logger = debugTee(deps.logger)
     this.resolveWorkspaceRoot = deps.resolveWorkspaceRoot
     this.getSelection = deps.getSelection
     this.provider = nonEmpty(config.provider) ?? 'zcode'
@@ -1301,6 +1302,27 @@ function nonEmpty(value: string | undefined): string | undefined {
   if (value === undefined) return undefined
   const trimmed = value.trim()
   return trimmed.length === 0 ? undefined : trimmed
+}
+
+/**
+ * Field diagnostics tee: when `ZCODE_DEBUG_LOG` names a file, every logger
+ * record is also appended there (one JSON line each). Exists because the host
+ * console is invisible in the field — a Pocket-side "发送失败" cannot be
+ * diagnosed without a durable record of the adapter's own view of the turn.
+ * Always-on cost when unset: one `process.env` read per construction.
+ */
+function debugTee(logger: ZcodeAdapterDeps['logger']): ZcodeAdapterDeps['logger'] {
+  const target = process.env.ZCODE_DEBUG_LOG
+  if (target === undefined || target.trim().length === 0) return logger
+  const path = target.trim()
+  return (record: unknown): void => {
+    try {
+      appendFileSync(path, `${JSON.stringify({ t: new Date().toISOString(), record })}\n`, { flag: 'a' })
+    } catch {
+      // Diagnostics must never break a turn: a failed append is swallowed.
+    }
+    logger(record)
+  }
 }
 
 /** Re-export so consumers of this module need one import for the error type. */
