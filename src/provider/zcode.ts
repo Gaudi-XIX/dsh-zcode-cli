@@ -635,6 +635,15 @@ export class ZcodeAdapter extends LlmAdapter {
           }
         }
       }
+      // The provider rejected the request for size, not the session: the CLI
+      // session (and its remembered id) stays valid for a shorter turn.
+      if (failure?.code === 'ZCODE_UNKNOWN' && /context window/i.test(failure.message)) {
+        failure = {
+          code: 'ZCODE_OUTPUT_TOO_LARGE',
+          message: 'Model request exceeded the provider context window. '
+            + 'Start a new DSH session (or switch this session back to a model with a larger window) and retry.',
+        }
+      }
     } catch (error) {
       if (error instanceof ZcodeError) failure = toLlmFailure(error)
       else {
