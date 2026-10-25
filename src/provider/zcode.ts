@@ -43,7 +43,12 @@
  * decides whether a tool *request* is honored, because a headless `--mode
  * guarded` process has no approval channel and cannot honor one:
  *
- * | policy | request carries `tools` | `temperature`/`maxTokens`/`stop` | image/file block | a tool-shaped stdout frame |
+ * Sampling fields (`temperature`/`maxTokens`/`stop`) apply to the `-p` route
+ * only: the app-server protocol has no such fields, and DSH web sends defaults
+ * on every turn, so the free-plan route drops them silently (agy.ts made the
+ * same call) instead of refusing the request.
+ *
+ * | policy | request carries `tools` | `temperature`/`maxTokens`/`stop` (-p route) | image/file block | a tool-shaped stdout frame |
  * | --- | --- | --- | --- | --- |
  * | `reject` | refused before spawn: `UNSUPPORTED_TOOLS` | refused before spawn: `UNSUPPORTED_OPTION` | refused before spawn: `UNSUPPORTED_CONTENT` | child killed; `PERMISSION_REQUIRED` or `UNSUPPORTED_TOOLS` |
  * | `zcode-owned` | schemas dropped, turn proceeds | refused before spawn: `UNSUPPORTED_OPTION` | projected to placeholder text | child killed; `PERMISSION_REQUIRED` or `UNSUPPORTED_TOOLS` |
@@ -493,21 +498,10 @@ export class ZcodeAdapter extends LlmAdapter {
       }
       return
     }
-    const unsupported = unsupportedOptions(options)
-    if (unsupported.length > 0) {
-      yield {
-        type: 'finish',
-        reason: {
-          kind: 'error',
-          failure: {
-            code: 'UNSUPPORTED_OPTION',
-            message: `ZCode 0.17.0's app-server turn has no place for ${unsupported.join(', ')}; `
-              + 'this adapter refuses the request instead of silently dropping the setting.',
-          },
-        },
-      }
-      return
-    }
+    // DSH web sends default temperature/maxTokens on every turn (agy.ts hit the
+    // same wall and resolved it by continuing with CLI defaults instead of
+    // refusing). The app-server protocol has no such fields, so they are
+    // dropped here and the CLI's own defaults apply.
 
     const prompt = this.buildPrompt(options, false)
     const recorded = shared && conversationId !== undefined ? this.sessions.get(conversationId) : undefined
