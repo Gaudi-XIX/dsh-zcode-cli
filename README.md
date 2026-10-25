@@ -66,7 +66,7 @@ DSH 市场里已有两条同走官方 CLI 委托路线的 ZCode 插件，都是�
 node scripts/run-tests.mjs    # AC11 行尾 → tsc --noEmit → build → tsc client → build:client → 包入口点 → 测试面计数 → node --test
 ```
 
-`tests/` 下 14 个 `*.test.mjs`；脚本里的显式清单、`docs/dsh-provider-contract.md` 的「测试面」计数与磁盘实点三者必须一致，否则门禁在跑测试前就停。用例总数同样锁死（171，`EXPECTED_TEST_CASES` 与文档「测试用例」行），删掉一个 `test()` 块也会让门禁变红。免费路线由一个实现了 app-server 协议的 fake CLI 端到端覆盖（流式/短答/resume/死会话/准入），浏览器半边字面量由 `tests/client.test.mjs` 逐项钉住。
+`tests/` 下 14 个 `*.test.mjs`；脚本里的显式清单、`docs/dsh-provider-contract.md` 的「测试面」计数与磁盘实点三者必须一致，否则门禁在跑测试前就停。用例总数同样锁死（173，`EXPECTED_TEST_CASES` 与文档「测试用例」行），删掉一个 `test()` 块也会让门禁变红。免费路线由一个实现了 app-server 协议的 fake CLI 端到端覆盖（流式/短答/resume/死会话/准入），浏览器半边字面量由 `tests/client.test.mjs` 逐项钉住。
 
 ## 已知限制（摘要）
 

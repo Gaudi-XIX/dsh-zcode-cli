@@ -6,9 +6,28 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createHash } from 'node:crypto'
-import { resolve } from 'node:path'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
-import { buildZcodeAccountConfig } from '../lib/zcode/account-config.js'
+import {
+  buildZcodeAccountConfig,
+  DEFAULT_START_PLAN_CONNECTION_KEY,
+  readRuntimeBuiltinRevisionTag,
+} from '../lib/zcode/account-config.js'
+
+/** An empty log dir (no runtime tag available). */
+const EMPTY_DIR = mkdtempSync(join(tmpdir(), 'zcode-acct-empty-'))
+/** A log dir whose newest file carries a runtime delivery line. */
+const LOG_DIR_WITH_TAG = (() => {
+  const dir = mkdtempSync(join(tmpdir(), 'zcode-acct-log-'))
+  mkdirSync(join(dir, 'sub'), { recursive: true })
+  writeFileSync(join(dir, '2026-10-26.log'),
+    'noise without a tag\n'
+    + '... receivedRevision":"account:[\\"zcode-builtin:33:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\",'
+    + 'noise after\n', 'utf8')
+  return dir
+})()
 
 /** A reduced builtin config: all ten account providers, the real ids. */
 const ACCOUNT_IDS = [
@@ -69,13 +88,33 @@ test('builds ten account providers with the target enabled', () => {
   assert.equal(zaiStart.baseUrl, 'https://zcode.z.ai/api/v1/zcode-plan/anthropic')
 })
 
-test('basedOnZCodeBuiltinRevision is zcode-builtin:<revision>:<64hex of resolved path>', async () => {
-  const config = buildZcodeAccountConfig(BASE)
+test('basedOnZCodeBuiltinRevision falls back to the path hash without runtime logs', async () => {
+  const config = buildZcodeAccountConfig({ ...BASE, runtimeLogDir: EMPTY_DIR })
   const match = /^zcode-builtin:33:([0-9a-f]{64})$/.exec(config.basedOnZCodeBuiltinRevision)
   assert.ok(match, config.basedOnZCodeBuiltinRevision)
   // Same hash the CLI computes: sha256 over the resolved absolute path.
   assert.equal(match[1], sha256(resolve('F:/fake/zcode-builtin.json')))
   assert.equal(config.updateParams.basedOnZCodeBuiltinRevision, config.basedOnZCodeBuiltinRevision)
+})
+
+test('the runtime-reported tag wins over the path hash and lands in the canonical revision', () => {
+  const config = buildZcodeAccountConfig({ ...BASE, runtimeLogDir: LOG_DIR_WITH_TAG })
+  assert.equal(config.basedOnZCodeBuiltinRevision, 'zcode-builtin:33:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')
+  // canonical revision embeds [basedOn, providers array, states]
+  const parsed = JSON.parse(config.updateParams.revision.slice('account:'.length))
+  assert.equal(parsed[0], 'zcode-builtin:33:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')
+  assert.equal(parsed[1].length, 10)
+  assert.ok(parsed[1].every(entry => typeof entry.providerId === 'string' && typeof entry.config === 'object'))
+  assert.equal(parsed[2]['account:bigmodel-start-plan'].connectionKey, DEFAULT_START_PLAN_CONNECTION_KEY)
+})
+
+test('readRuntimeBuiltinRevisionTag reads the newest delivery line and tolerates junk dirs', () => {
+  assert.equal(
+    readRuntimeBuiltinRevisionTag(LOG_DIR_WITH_TAG),
+    'zcode-builtin:33:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+  )
+  assert.equal(readRuntimeBuiltinRevisionTag(EMPTY_DIR), undefined)
+  assert.equal(readRuntimeBuiltinRevisionTag('F:/definitely/not/a/dir'), undefined)
 })
 
 test('revision differs when revisionSeed differs', () => {

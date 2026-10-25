@@ -88,7 +88,7 @@ const EXPECTED_TEST_FILES = [
  * `docs/dsh-provider-contract.md` and with the summary `node --test` prints.
  * Adding or removing a case means updating all three.
  */
-const EXPECTED_TEST_CASES = 171
+const EXPECTED_TEST_CASES = 173
 
 /**
  * Recursively collect `*.test.mjs` under the tests directory.
