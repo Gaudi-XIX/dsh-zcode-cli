@@ -246,7 +246,7 @@ type AbortCause = 'caller' | 'tool' | 'in-band-error'
  * tests must be able to run with no filesystem at all.
  */
 export interface ZcodeSelectionLike {
-  /** Label only under the CLI transport — both plans spawn the same command. */
+  /** Transport selector: "free" runs the app-server channel, anything else the one-shot `-p` subprocess. */
   readonly plan?: string | undefined
   /** The model the card picked; the CLI honours it, `plan` and `effort` do not. */
   readonly model?: string | undefined
@@ -394,10 +394,11 @@ export class ZcodeAdapter extends LlmAdapter {
    * provider facts this adapter collected.
    */
   override async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk, void, void> {
-    // The card's live choice, read once per turn. Only `model` reaches the
-    // spawned command: the CLI has no `--effort` flag, and `plan` selects which
-    // account ZCode itself signs its own requests with — the command line is
-    // identical for both plans, so it must never be read as a transport switch.
+    // The card's live choice, read once per turn. `plan` selects the transport
+    // (streamTurn routes "free" to the app-server channel); within the -p route
+    // the command line is identical for both plans — the CLI has no --effort
+    // flag, and the account ZCode signs its own requests with comes from ZCode's
+    // own state files, not from this selection.
     const selection = this.getSelection?.()
     const selectedModel = nonEmpty(selection?.model)
     const model = selectedModel ?? this.model

@@ -72,11 +72,13 @@ class ZcodeAdapter extends LlmAdapter {
 
 ## 传输通路（唯一：CLI 委托）
 
-**只有一条通路：spawn 官方 `zcode.cjs`。** 这是用户 2026-10-24 定的口径（"HTTP 肯定不能用……我只走 C 的，不可能走 HTTP 的"），理由有三层：① 只有官方二进制自己带 ed25519 客户端请求签名，第三方 HTTP 无论伪装多少请求头都过不了 Coding Plan 档的签名校验；② 免费 Start Plan 端点对无签名请求会回 `405 [3012] request has been blocked due to unusual activity`，且带账号惩罚阶梯（30 分钟 → 24 小时 → 停用）；③ 进程委托不持有、不解密任何凭据——与 `dsh-agy-provider` 同一条合规底线。
+**只有一条通路：spawn 官方 `zcode.cjs`。** 这是用户 2026-10-24 定的口径（"HTTP 肯定不能用……我只走 C 的，不可能走 HTTP 的"），理由有三层：① 只有官方二进制自己带 ed25519 客户端请求签名，第三方 HTTP 无论伪装多少请求头都过不了 Coding Plan 档的签名校验；② 免费 Start Plan 端点对无签名请求会回 `405 [3012] request has been blocked due to unusual activity`，且带账号惩罚阶梯（30 分钟 → 24 小时 → 停用）；③ 插件不伪造任何网络请求——所有上游流量都由官方二进制自己签名发起。
+
+**凭据边界的精确表述（2026-10-25 免费路线引入后修订）**：`-p` 路线不读任何凭据。免费路线须从 ZCode 凭据文件解密 plan token（`src/zcode/credential.ts`），但它只在本机内存中经 app-server 回调交还官方 CLI 自身使用（token 不落日志、不落盘、不进错误消息）；插件自己从不发起上游网络请求。这与「抽 token 走反代/伪装客户端」有本质区别——后者才是红线。
 
 因此 `config.channel` 这个概念**已整体删除**（含 `free` / `paid` 两个 HTTP 通道、`src/zcode/http-channel.ts`、`src/zcode/billing.ts`、`ZCODE_HTTP` 一族错误码、`/plugins/zcode-provider/billing` 路由）。HTTP 直连在 2026-10-24 14:50 曾跑通过两轮工具闭环，随后被 3012 风控永久标记，不再作为任何路径保留。
 
-浏览器端卡片上的「套餐」下拉（`free` / `paid`）**不是传输选择，是标签**：两条都 spawn 同一条命令，实际走哪个套餐由 ZCode 自己的状态文件决定——`<ZCODE_DATA_BASE_DIR>/.zcode/v2/setting.json` 的 `providerFamilyConnectionSelections.<family>.kind`（`start-plan` / `individual-coding-plan` / `team-coding-plan`）与同目录 `provider_config.json` 的 `defaultModelSelection`。插件**只读**这两个文件（`src/zcode/profile.ts`），从不写：那是另一个应用的状态，且 `provider_config.json` 里带着它的 API key。
+浏览器端卡片上的「套餐」下拉（`free` / `paid`）自 2026-10-25 起是**传输选择**：`free` 走 app-server 注入通道（`streamFreeTurn`），其余值走一次性 `-p` 子进程（`streamTurn`）——两条都是 spawn 官方二进制的 CLI 委托，区别只在协议。在 `-p` 路线内部两个套餐的命令行完全相同；卡面上的实际套餐身份仍由 ZCode 自己的状态文件决定——`<ZCODE_DATA_BASE_DIR>/.zcode/v2/setting.json` 的 `providerFamilyConnectionSelections.<family>.kind`（`start-plan` / `individual-coding-plan` / `team-coding-plan`）与同目录 `provider_config.json` 的 `defaultModelSelection`。插件**只读**这些文件（免费路线另读 `credentials.json` 的 plan token，见上），从不写：那是另一个应用的状态，且 `provider_config.json` 里带着它的 API key。
 
 ## StreamChunk 顺序
 
@@ -242,7 +244,7 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 - 槽键：`ctx.slots.register({ name: 'settings.models.provider-card', key: 'dsh-zcode-provider', id: 'zcode-provider-card' }, …)`。`key` 必须**逐字等于** Node 半边的 `ZCODE_SETTINGS_NS`（`src/index.ts`），宿主按这个字符串匹配，写错一个字符就回到空白行。
 - 槽位 props 只有 `{ provider, configured, keyConfigured }`，**不含配置本体**（配置在同一个槽的兄弟表单里）。卡片上半部分是**运行配置块**（套餐 / 模型 / 推理强度三个 `<select>`，读写插件自己的 loopback state 路由），下半部分是**只读信息面板**：路由 / 命名空间 / 模型目录 / 随包默认值（`sessionMode` / `toolPolicy` / `mode` / `imageInput`）/ CLI 入口（`node` 与 `zcode.cjs` 绝对路径）/ 环境契约五变量。除该 state 路由外，卡片不读写宿主配置，也不碰任何 ZCode 文件。
 - state 路由契约：`GET`/`POST /plugins/dsh-zcode-provider/state`（`ZCODE_STATE_ROUTE_PATH`，`src/web/router.ts`；客户端字面量 `STATE_PATH`，`tests/client.test.mjs` 钉住两者相等）。成功信封 `{ ok: true, state: { plan, model, effort, plans[], models[], efforts[] }, error: null }`；失败 `{ ok: false, error: { code, message } }`；无法识别的值回 `400` + `error.code = 'INVALID_SELECTION'`。客户端 `readSelectionEnvelope()` 只接受 `ok === true` 且 `state` 齐备，否则渲染成一行失败提示而不是静默空白。
-- 选项语义：`plans` 两个（`free` 免费套餐 / `paid` 付费套餐）在 CLI 单通路下是**标签**，切换不改变 spawn 的 argv。`model` 与 `effort` 同样不改变 argv——0.17.0 的 CLI 没有 `--model` / `--effort` 旗标，实际跑哪个模型由 ZCode 自己的 `provider_config.json`（插件只读）决定。selection 的作用是**让卡片的选择与守卫一致**：请求模型与选择模型或配置默认模型都不相等时才 `MODEL_NOT_FOUND` 且不 spawn。
+- 选项语义：`plans` 两个（`free` 免费套餐 / `paid` 付费套餐）。`plan` **决定传输路线**（`free`＝app-server 注入通道，其余＝一次性 `-p`）；在 `-p` 路线内部它不改变 argv。`model` 与 `effort` 在 `-p` 路线不改变 argv——0.17.0 的 CLI 没有 `--model` / `--effort` 旗标（免费路线里两者经 `session/send` 的 `modelSelection` 真实下发）。selection 的作用是**让卡片的选择与守卫一致**：请求模型与选择模型或配置默认模型都不相等时才 `MODEL_NOT_FOUND` 且不 spawn。
 - 样式：`client/styles.ts` 导出 `ZC_CSS`，由卡片在渲染树里 `h('style', null, ZC_CSS)` 注入；下拉样式照抄 `F:\defws\dsh-agy-provider\client\index.ts` 的 `.agy-select`（改名 `zc-select`，连同 `:root` 亮/暗色变量与 `.zc-btn`），这是用户明确要求「参考我已经做好的，不要自己造轮子」的落点。
 - Hook 纪律：`useState` / `useEffect` 只在组件上方的 `useTranslation()` 与 `useSelection()` 里，组件函数体**只有两句 hook（都在首行区）、只有一个 return**。宿主用 `SlotErrorBoundary` 包住槽内容，渲染期抛异常会渲染成空元素——hook 在条件 return 之后导致 hook 数变化时，症状与本卡片要修的空白行一模一样。`tests/client.test.mjs` 把这条结构钉住。
 - 漂移防线：卡片不能 import `src/provider/config.ts`（会拖入 schemastery 与适配器模块图，浏览器侧无法解析），所以模型目录、默认值与环境契约是**手抄字面量**；`tests/client.test.mjs` 逐项与 `src/` 和 `cordis.patch.yml` 比对，任一侧改了没同步就判红。
@@ -260,7 +262,7 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 ## 已知限制
 
 - **L1 未验证成功路径**：账号 1309，`-p` 成功时的 stdout 形状（NDJSON 还是整段 JSON）没有读数，因此 `parseStdout()` 的口径是结构推定，不是实测。
-- **L2 未验证 sessionId**：拿不到 `sess_…` 的稳定来源，`sessionMode: resume` 因此不可用，默认 `full`。
+- **L2 未验证 sessionId**：`-p` 成功时 stdout 是否携带 `sess_…` 无读数（免费路线的 app-server sessionId 已可用）。`sessionMode: resume` 在两条路线均已实现并有测试覆盖，但真实 CLI 的 `--resume` / `session/resume` 行为未实测，默认仍为 `full`；插件不伪造 id。
 - **L3 未验证 `--mode guarded` 非交互行为**：要求写文件的 prompt 在守护模式下的表现（挂起 / 排队 / 被拒）未观测。
 - **L4 未验证 150% 计费**：产品目标要求的倍率没有服务端账单读数，**禁止用本地文件推断计费**。
 - **L5 不判权益**：doctor 与运行时都不判断套餐状态，1309 只作为历史观测记录。
