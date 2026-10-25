@@ -22,6 +22,7 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process'
 
 import { ZcodeError } from '../provider/error-codes.js'
+import { ZcodeCredentialError } from './credential.js'
 import { terminateProcessTree } from './process.js'
 
 /** One projected output frame, in arrival order. */
@@ -146,8 +147,17 @@ function fail(code: ZcodeAppServerErrorCode, message: string, cause?: unknown): 
   return new ZcodeError(code, message, cause === undefined ? {} : { cause })
 }
 
-/** The codes this module raises (all already in `ZCODE_ERROR_CODES`). */
-type ZcodeAppServerErrorCode = 'ZCODE_EXIT' | 'TIMEOUT' | 'ZCODE_PARSE' | 'ZCODE_UNKNOWN' | 'ABORTED'
+/** The codes this module raises (all already in `ZCODE_ERROR_CODES`; the three
+ *  credential codes arrive wrapped from the plan-token callback). */
+type ZcodeAppServerErrorCode =
+  | 'ZCODE_EXIT'
+  | 'TIMEOUT'
+  | 'ZCODE_PARSE'
+  | 'ZCODE_UNKNOWN'
+  | 'ABORTED'
+  | 'ZCODE_CREDENTIAL_MISSING'
+  | 'ZCODE_CREDENTIAL_INVALID'
+  | 'ZCODE_CREDENTIAL_DECRYPT_FAILED'
 
 function errorText(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
@@ -378,12 +388,11 @@ class AppServerSession {
 
     // Terminal: the CLI emits a turn.terminal event whose kind/status sit at the
     // envelope top level (v4/telemetry/event) or inside `payload` (session/event
-    // alternates: turn.completed / turn.failed). Locked against the live wire in
-    // `appserver-events.jsonl`.
-    const isTerminal = kind === 'turn.terminal'
-      || params.type === 'turn.terminal'
-      || params.type === 'turn.completed'
-      || params.type === 'turn.failed'
+    // alternates: turn.completed / turn.failed). Both spellings are matched on
+    // both carriers: `kind` may come from `params.kind` (envelope) or
+    // `payload.kind` (session/event), and `params.type` from either.
+    const isTerminal = kind === 'turn.terminal' || kind === 'turn.completed' || kind === 'turn.failed'
+      || params.type === 'turn.terminal' || params.type === 'turn.completed' || params.type === 'turn.failed'
     if (isTerminal) {
       const rawStatus = firstString(payload.status, params.status, payload.resultType)
       const status: 'success' | 'failed' = rawStatus === 'success' ? 'success' : 'failed'
@@ -465,7 +474,12 @@ class AppServerSession {
 
   private setFailure(cause: ZcodeError | Error): void {
     if (this.failure !== undefined) return
-    this.failure = cause instanceof ZcodeError ? cause : fail('ZCODE_UNKNOWN', errorText(cause))
+    if (cause instanceof ZcodeError) this.failure = cause
+    // A credential failure keeps its own code (`ZCODE_CREDENTIAL_*`): the
+    // callback contract promises the error bubbles up untouched, and the code
+    // is what tells an operator to re-login instead of debugging the transport.
+    else if (cause instanceof ZcodeCredentialError) this.failure = fail(cause.code, cause.message)
+    else this.failure = fail('ZCODE_UNKNOWN', errorText(cause))
     this.kill()
   }
 

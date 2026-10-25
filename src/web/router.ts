@@ -106,12 +106,20 @@ const MAX_SELECTION_BODY_BYTES = 16 * 1024
 function sendRouteJson(res: ServerResponse, status: number, body: unknown): void {
   if (res.headersSent || res.writableEnded) return
   const text = JSON.stringify(body)
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': String(Buffer.byteLength(text, 'utf8')),
-    'Cache-Control': 'no-store',
-  })
-  res.end(text)
+  // A peer that hung up mid-request (the bounded body reader destroys the
+  // socket) turns a write into a late 'error' on this response; without a
+  // listener that becomes an uncaught exception in the host process.
+  res.once('error', () => {})
+  try {
+    res.writeHead(status, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': String(Buffer.byteLength(text, 'utf8')),
+      'Cache-Control': 'no-store',
+    })
+    res.end(text)
+  } catch {
+    // The connection is gone; there is no one left to answer.
+  }
 }
 
 function isLoopbackRequest(req: IncomingMessage): boolean {

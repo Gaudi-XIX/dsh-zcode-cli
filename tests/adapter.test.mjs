@@ -27,6 +27,70 @@ const FAKE_CLI = String.raw`
 const { appendFileSync } = require('node:fs')
 
 const argv = process.argv.slice(2)
+
+// The free-plan route runs "zcode.cjs app-server --stdio": a line-delimited
+// JSON protocol where every request is answered and a turn is streamed as
+// session/event notifications. One scripted server covers the free-route
+// scenarios at the bottom of this file; the scenario is picked from the marker
+// inside session/send's content.
+if (argv[0] === 'app-server') {
+  const sessionLog = process.env.ZCODE_FAKE_LOG
+  if (sessionLog) appendFileSync(sessionLog, JSON.stringify({ appServer: true }) + '\n')
+  const usage = { inputTokens: 8, outputTokens: 2, totalTokens: 10 }
+  let current = 'sess_app-1'
+  const reply = (id, result) => process.stdout.write(JSON.stringify({ id, result }) + '\n')
+  const failRequest = (id, message) => process.stdout.write(JSON.stringify({ id, error: { code: -32000, message } }) + '\n')
+  const event = (type, payload) => process.stdout.write(JSON.stringify({
+    method: 'session/event',
+    params: { sessionId: current, type, seq: 1, payload },
+  }) + '\n')
+
+  let buffer = ''
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', (chunk) => {
+    buffer += chunk
+    let newline
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, newline).trim()
+      buffer = buffer.slice(newline + 1)
+      if (line.length === 0) continue
+      let msg
+      try { msg = JSON.parse(line) } catch { continue }
+      if (msg.id === undefined || msg.method === undefined) continue
+      switch (msg.method) {
+        case 'provider/refreshRegistry': reply(msg.id, { refreshed: true }); break
+        case 'provider/updateAccountConfig': reply(msg.id, { status: 'ok' }); break
+        case 'session/create':
+          current = 'sess_app-1'
+          reply(msg.id, { session: { sessionId: current, settings: {} } })
+          break
+        case 'session/resume':
+          if (msg.params.sessionId === 'sess_dead') failRequest(msg.id, 'session not found: sess_dead')
+          else { current = msg.params.sessionId; reply(msg.id, { session: { sessionId: current, settings: {} } }) }
+          break
+        case 'session/subscribe': reply(msg.id, {}); break
+        case 'session/send': {
+          if (sessionLog) appendFileSync(sessionLog, JSON.stringify({ send: msg.params.content, model: msg.params.modelSelection?.modelId }) + '\n')
+          reply(msg.id, { turnId: 't' })
+          const content = msg.params.content ?? ''
+          if (content.includes('@@free-stream@@')) {
+            event('model.streaming', { kind: 'text_delta', delta: 'pon' })
+            event('model.streaming', { kind: 'text_delta', delta: 'g' })
+            event('turn.completed', { response: 'pong', resultType: 'success', usage })
+          } else if (content.includes('@@free-short@@')) {
+            event('turn.completed', { response: 'pong', resultType: 'success', usage })
+          } else {
+            event('turn.completed', { response: 'fresh', resultType: 'success' })
+          }
+          break
+        }
+        default: reply(msg.id, {}); break
+      }
+    }
+  })
+  return
+}
+
 const promptIndex = argv.indexOf('-p')
 const prompt = promptIndex === -1 ? '' : (argv[promptIndex + 1] ?? '')
 const resumeIndex = argv.indexOf('--resume')
@@ -155,6 +219,7 @@ function adapter(t, overrides = {}, deps = {}) {
   }, {
     logger: record => { t?.diagnostic?.(JSON.stringify(record)) },
     resolveWorkspaceRoot: deps.resolveWorkspaceRoot ?? (async () => workspace),
+    ...(deps.getSelection !== undefined ? { getSelection: deps.getSelection } : {}),
   })
   return instance
 }
@@ -707,4 +772,142 @@ test('a parse failure keeps the record: a clean exit leaves the session id usabl
   // never seen a successful stdout (F-1), not that the server-side session is
   // dead. Dropping the id here would destroy a session nothing proves broken.
   assert.deepEqual(storedConversations(path), ['conversation-parse'])
+})
+
+// ---------------------------------------------------------------------------
+// Free-plan route (app-server channel)
+//
+// The fake CLI above also implements the `app-server --stdio` protocol, so the
+// same adapter drives the free-plan transport end to end. The fake builtin
+// provider config below is what `buildZcodeAccountConfig` reads; the selection
+// pointing at `free` is what sends a turn down this route at all.
+// ---------------------------------------------------------------------------
+
+/** Point the env contract at a fake builtin config, then restore it. */
+async function withFakeBuiltin(fn) {
+  const builtinPath = join(directory, 'fake-builtin.json')
+  writeFileSync(builtinPath, JSON.stringify({
+    revision: 33,
+    config: {
+      providerConfigRules: {
+        providerRules: [{
+          providerId: 'account:bigmodel-start-plan',
+          config: {
+            access: { type: 'zhipu-account', mode: 'start-plan', accountType: 'bigmodel' },
+            api: { baseUrl: 'https://fake.invalid' },
+            builtinModelIds: ['GLM-5.3-Flash'],
+          },
+        }],
+      },
+    },
+  }), 'utf8')
+  const saved = process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE
+  process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = builtinPath
+  try {
+    return await fn()
+  } finally {
+    if (saved === undefined) delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE
+    else process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = saved
+  }
+}
+
+/** An adapter whose card selection pins the free plan (the app-server route). */
+const freeAdapter = (t, overrides = {}, deps = {}) =>
+  adapter(t, overrides, { getSelection: () => ({ plan: 'free' }), ...deps })
+
+test('free route: a streamed turn is not doubled by the terminal response text', async t => {
+  await withFakeBuiltin(async () => {
+    const chunks = await collect(freeAdapter(t).stream(request('@@free-stream@@ pong')))
+    assert.equal(terminalFailure(chunks), undefined)
+
+    // The streamed deltas are the only text source: the terminal event also
+    // carries the full "pong", and a turn that projected both would answer
+    // with "pongpong".
+    const deltas = chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text)
+    assert.deepEqual(deltas, ['pon', 'g'])
+    const blockEnd = chunks.find(chunk => chunk.type === 'block-end')
+    assert.deepEqual(blockEnd.block, { type: 'text', text: 'pong' })
+
+    const usage = chunks.find(chunk => chunk.type === 'usage')
+    assert.deepEqual(usage.usage, { inputTokens: 8, outputTokens: 2, totalTokens: 10 })
+    assert.equal(chunks.at(-1).reason.kind, 'stop')
+  })
+})
+
+test('free route: a short turn falls back to the terminal response text', async t => {
+  await withFakeBuiltin(async () => {
+    // Short turns skip model.streaming entirely; the terminal event's
+    // `response` field is then the only text the route has.
+    const chunks = await collect(freeAdapter(t).stream(request('@@free-short@@')))
+    assert.equal(terminalFailure(chunks), undefined)
+
+    const deltas = chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text)
+    assert.deepEqual(deltas, ['pong'])
+    const blockEnd = chunks.find(chunk => chunk.type === 'block-end')
+    assert.deepEqual(blockEnd.block, { type: 'text', text: 'pong' })
+  })
+})
+
+test('free route: resume narrows the prompt to the new turn', async t => {
+  await withFakeBuiltin(async () => {
+    const instance = freeAdapter(t, { sessionMode: 'resume' })
+    const conversation = 'conversation-free'
+
+    const sendsBefore = argvLog().filter(entry => entry.send !== undefined).length
+
+    const first = await collect(instance.stream(request('@@free-new@@ first question', { sessionId: conversation })))
+    assert.equal(terminalFailure(first), undefined)
+
+    const history = [
+      { role: 'user', content: [{ type: 'text', text: '@@free-new@@ first question' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'fresh' }],
+        source: { kind: 'model', provider: 'zcode', model: 'GLM-5.3-Flash' },
+      },
+      { role: 'user', content: [{ type: 'text', text: '@@free-new@@ second question' }] },
+    ]
+    const second = await collect(instance.stream({ ...request(''), messages: history, sessionId: conversation }))
+    assert.equal(terminalFailure(second), undefined)
+
+    const sends = argvLog().filter(entry => entry.send !== undefined).slice(sendsBefore)
+    assert.equal(sends.length, 2)
+    assert.match(sends[0].send, /first question/)
+    assert.doesNotMatch(sends[1].send, /first question/, 'the resumed session already holds the first turn')
+    assert.match(sends[1].send, /second question/)
+  })
+})
+
+test('free route: a dead resumed session is forgotten after the turn fails', async t => {
+  await withFakeBuiltin(async () => {
+    const path = seedSession('free-dead-sessions.json', 'conversation-free-dead', 'sess_dead')
+    const instance = freeAdapter(t, { sessionMode: 'resume', sessionStorePath: path })
+
+    const failure = terminalFailure(await collect(instance.stream(request('@@free-new@@ dead', {
+      sessionId: 'conversation-free-dead',
+    }))))
+    assert.equal(failure?.code, 'ZCODE_UNKNOWN')
+    assert.deepEqual(storedConversations(path), [], 'the dead id must be dropped from the durable map')
+  })
+})
+
+test('free route: reject policy refuses attachments before the session opens', async t => {
+  await withFakeBuiltin(async () => {
+    const instance = freeAdapter(t, { toolPolicy: 'reject' })
+    const media = {
+      messages: [{
+        role: 'user',
+        content: [{ type: 'image', attachment: { attachmentId: 'a1', name: 'shot.png', mimeType: 'image/png', width: 10, height: 10, bytes: 1234 } }],
+      }],
+    }
+
+    const bootsBefore = argvLog().filter(entry => entry.appServer === true).length
+    const failure = terminalFailure(await collect(instance.stream(request('@@free-new@@', media))))
+    assert.equal(failure?.code, 'UNSUPPORTED_CONTENT')
+    assert.equal(
+      argvLog().filter(entry => entry.appServer === true).length,
+      bootsBefore,
+      'a refused request must not start the app-server process',
+    )
+  })
 })

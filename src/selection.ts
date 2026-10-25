@@ -182,8 +182,13 @@ export class SelectionStore {
 
   /** Persist a patch and return the new selection. */
   async write(patch: ZcodeSelectionPatch): Promise<ZcodeSelectionState> {
-    const next = applySelectionPatch(this.#current, patch)
+    // The patch is applied *inside* the queued run, not before queuing: two
+    // writes arriving together must compose against each other. Applying up
+    // front would merge both against the same pre-queue snapshot and the first
+    // write's field would be silently lost (pick "paid", then "effort=low", end
+    // up back on "free").
     const run = async (): Promise<ZcodeSelectionState> => {
+      const next = applySelectionPatch(this.#current, patch)
       const directory = dirname(this.#filePath)
       await this.#makeDirectory(directory)
       const temp = `${this.#filePath}.${process.pid}.${Date.now().toString(36)}.tmp`

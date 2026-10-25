@@ -143,7 +143,14 @@ import { appendFileSync } from 'node:fs'
 import { QUOTA_PROVIDER_CODE, recordQuotaObservation } from '../diagnostics.js'
 import { FileSessionStore, sessionStorePath } from '../session/file-store.js'
 import { SessionRegistry } from '../session/store.js'
-import { runZcode, type ZcodeProcessConfig } from '../zcode/process.js'
+import {
+  ENV_NAME_PATTERN,
+  NODE_OPTIONS_REQUIRED,
+  ZCODE_ENV_ALLOWLIST,
+  resolveNodeOptions,
+  runZcode,
+  type ZcodeProcessConfig,
+} from '../zcode/process.js'
 import { ZcodeStreamParser, parseStdout, type ZcodeFrame, type ZcodeTokenUsage } from '../zcode/parser.js'
 import { buildZcodeAccountConfig, type ZcodeAccountConfig } from '../zcode/account-config.js'
 import { runZcodeAppServerTurn, type ZcodeAppServerDeps } from '../zcode/app-server.js'
@@ -459,7 +466,7 @@ export class ZcodeAdapter extends LlmAdapter {
       this.logger({
         kind: failure === undefined ? 'zcode.request.completed' : 'zcode.request.failed',
         provider: this.provider,
-        model: this.model,
+        model,
         transport: 'app-server',
         toolPolicy: this.toolPolicy,
         sharedSession: shared,
@@ -509,16 +516,37 @@ export class ZcodeAdapter extends LlmAdapter {
           + 'ZCode runs its own tools for this turn (zcode-owned semantics)',
       })
     }
+    if (this.toolPolicy === 'reject') {
+      const media = countMediaBlocks(options.messages)
+      if (media > 0) {
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: {
+              code: 'UNSUPPORTED_CONTENT',
+              message: `toolPolicy "reject" refuses ${media} image/file block(s) before the session opens: `
+                + 'reject promises to refuse anything this route cannot carry, and a text-only projection of an '
+                + 'attachment answers a different question. Use "zcode-owned" or "dsh-owned" for placeholder text.',
+            },
+          },
+        }
+        return
+      }
+    }
     // DSH web sends default temperature/maxTokens on every turn (agy.ts hit the
     // same wall and resolved it by continuing with CLI defaults instead of
     // refusing). The app-server protocol has no such fields, so they are
     // dropped here and the CLI's own defaults apply.
 
-    const prompt = this.buildPrompt(options, false)
+    // Session lookup happens before the prompt is built, mirroring the `-p`
+    // route: a resumed ZCode session already holds everything up to its last
+    // answer, so the prompt narrows to the new turn instead of replaying the
+    // whole history into a context that already has it.
     const recorded = shared && conversationId !== undefined ? this.sessions.get(conversationId) : undefined
-    const resumeSessionId = this.config.sessionMode === 'resume' && recorded !== undefined
-      ? recorded.sessionId
-      : undefined
+    const resume = this.config.sessionMode === 'resume' && recorded !== undefined
+    const resumeSessionId = resume && recorded !== undefined ? recorded.sessionId : undefined
+    const prompt = this.buildPrompt(options, resume)
 
     let account: ZcodeAccountConfig
     try {
@@ -546,7 +574,7 @@ export class ZcodeAdapter extends LlmAdapter {
     const appServerDeps: ZcodeAppServerDeps = {
       nodePath: this.processConfig.nodePath,
       zcodeCjsPath: this.processConfig.zcodeCjsPath,
-      env: freePlanEnv(),
+      env: freePlanEnv(this.config.passEnv ?? []),
       workspacePath: await this.resolveCwd(conversationId) ?? '.',
       workspaceKey: conversationId ?? 'adhoc',
       planToken: () => readZcodePlanToken(dataBaseDir),
@@ -582,14 +610,6 @@ export class ZcodeAdapter extends LlmAdapter {
       zcodeSessionId = result.zcodeSessionId
       if (shared && conversationId !== undefined && zcodeSessionId.length > 0) {
         this.remember(conversationId, zcodeSessionId)
-      }
-      // Short turns can skip `model.streaming` entirely; the terminal event's
-      // `response` field is then the only text source.
-      if (result.responseText !== undefined && result.responseText.length > 0 && !textOpen) {
-        textOpen = true
-        yield { type: 'block-start', index: blockIndex, blockType: 'text' }
-        textParts.push(result.responseText)
-        yield { type: 'text-delta', index: blockIndex, text: result.responseText }
       }
       if (result.terminal !== 'success' && result.errorCode === undefined) {
         failure = { code: 'ZCODE_UNKNOWN', message: 'ZCode app-server turn failed without an error code' }
@@ -644,14 +664,28 @@ export class ZcodeAdapter extends LlmAdapter {
             + 'Start a new DSH session (or switch this session back to a model with a larger window) and retry.',
         }
       }
+      // Short turns can skip `model.streaming` entirely; the terminal event's
+      // `response` field is then the only text source (also on a failed turn —
+      // a partial answer is worth showing). It is consulted only after the
+      // streamed frames, so a long turn whose terminal event also carries the
+      // full text is never projected twice.
+      if (!textOpen && result.responseText !== undefined && result.responseText.length > 0) {
+        textOpen = true
+        yield { type: 'block-start', index: blockIndex, blockType: 'text' }
+        textParts.push(result.responseText)
+        yield { type: 'text-delta', index: blockIndex, text: result.responseText }
+      }
     } catch (error) {
-      if (error instanceof ZcodeError) failure = toLlmFailure(error)
-      else {
+      if (isZcodeError(error)) {
+        this.noteQuotaObservation(error)
+        failure = toLlmFailure(error)
+      } else {
         failure = {
           code: 'ZCODE_UNKNOWN',
           message: boundDiagnostic(`ZCode app-server turn failed: ${error instanceof Error ? error.message : String(error)}`),
         }
       }
+      this.forgetStaleSession(failure, resume, conversationId)
     }
 
     if (reasoningOpen) {
@@ -891,7 +925,7 @@ export class ZcodeAdapter extends LlmAdapter {
     this.logger({
       kind: failure === undefined ? 'zcode.request.completed' : 'zcode.request.failed',
       provider: this.provider,
-      model: this.model,
+      model: options.model,
       toolPolicy: this.toolPolicy,
       sessionMode: resume ? 'resume' : 'full',
       sharedSession: shared,
@@ -1051,23 +1085,31 @@ export class ZcodeAdapter extends LlmAdapter {
     if (abortCause === 'caller') {
       return { code: 'ABORTED', message: 'The ZCode request was cancelled by the caller' }
     }
-    if (resume && conversationId !== undefined && DROPS_SESSION_ON.has(failure.code)) {
-      // A dead id fails identically on the next attempt, and retrying it in full
-      // mode would spend another quota unit on a guess (registered deviation
-      // D-b). Drop the record so the next turn starts clean — logging alone left
-      // resume mode reusing the dead id forever.
-      this.logger({ kind: 'zcode.session.stale', code: failure.code, conversationId })
-      try {
-        this.sessions.delete(conversationId)
-      } catch (forgetError) {
-        this.logger({
-          kind: 'zcode.session.forget.failed',
-          conversationId,
-          message: forgetError instanceof Error ? forgetError.message : String(forgetError),
-        })
-      }
-    }
+    this.forgetStaleSession(failure, resume, conversationId)
     return failure
+  }
+
+  /**
+   * Drop the remembered session id after a failure that means the id is dead.
+   *
+   * A dead id fails identically on the next attempt, and retrying it in full
+   * mode would spend another quota unit on a guess (registered deviation D-b).
+   * Dropping the record lets the next turn start clean — logging alone left
+   * resume mode reusing the dead id forever. Shared by both routes: the
+   * app-server channel fails its `session/resume` with the same codes.
+   */
+  private forgetStaleSession(failure: LlmFailure, resume: boolean, conversationId: string | undefined): void {
+    if (!resume || conversationId === undefined || !DROPS_SESSION_ON.has(failure.code)) return
+    this.logger({ kind: 'zcode.session.stale', code: failure.code, conversationId })
+    try {
+      this.sessions.delete(conversationId)
+    } catch (forgetError) {
+      this.logger({
+        kind: 'zcode.session.forget.failed',
+        conversationId,
+        message: forgetError instanceof Error ? forgetError.message : String(forgetError),
+      })
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1263,7 +1305,8 @@ function renderContent(content: readonly ContentBlock[]): string {
 }
 
 /** Project one parsed usage frame onto the disjoint DSH counters. */
-function toTokenUsage(usage: ZcodeTokenUsage): TokenUsage {  return {
+function toTokenUsage(usage: ZcodeTokenUsage): TokenUsage {
+  return {
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
     ...(usage.totalTokens === undefined ? {} : { totalTokens: usage.totalTokens }),
@@ -1370,13 +1413,24 @@ function zcodeBuiltinPath(): string {
 }
 
 /**
- * Environment for the app-server child: the same contract values the `-p`
- * route checks, passed explicitly because the injected account table must
- * point at the canonical builtin path (not the runtime cache) for the
- * injection to reach the provider registry.
+ * Environment for the app-server child: the same closed shape the `-p` route
+ * builds — OS variables from the allowlist, the four contract values, the
+ * operator's `passEnv` names, and a `NODE_OPTIONS` that always carries the DNS
+ * transport fix. The injected account table must point at the canonical builtin
+ * path (not the runtime cache) for the injection to reach the provider
+ * registry, hence the explicit `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` pass-through.
  */
-function freePlanEnv(): Readonly<Record<string, string>> {
+function freePlanEnv(passEnv: readonly string[]): Readonly<Record<string, string>> {
   const env: Record<string, string> = {}
+  for (const key of ZCODE_ENV_ALLOWLIST) {
+    const value = process.env[key]
+    if (value !== undefined && value.length > 0) env[key] = value
+  }
+  for (const key of passEnv) {
+    if (!ENV_NAME_PATTERN.test(key)) continue
+    const value = process.env[key]
+    if (value !== undefined && value.length > 0) env[key] = value
+  }
   const pick = (name: string): void => {
     const value = nonEmpty(process.env[name])
     if (value !== undefined) env[name] = value
@@ -1385,7 +1439,17 @@ function freePlanEnv(): Readonly<Record<string, string>> {
   pick('ZCODE_DATA_BASE_DIR')
   pick('ZCODE_PERSONAL_PROVIDER_CONFIG_FILE')
   pick('ZCODE_BUILTIN_PROVIDER_CONFIG_FILE')
-  pick('NODE_OPTIONS')
+  // The app-server child reaches the same API over HTTP as the `-p` child, so
+  // it gets the same ipv4-first fix. A host value carrying an unknown flag is
+  // dropped rather than inherited (an unknown flag can smuggle a `--require`)
+  // and never refused: this route degrades instead of failing the turn.
+  let nodeOptions: string
+  try {
+    nodeOptions = resolveNodeOptions(process.env['NODE_OPTIONS'])
+  } catch {
+    nodeOptions = NODE_OPTIONS_REQUIRED.join(' ')
+  }
+  env['NODE_OPTIONS'] = nodeOptions
   return env
 }
 

@@ -275,3 +275,22 @@ test('spawn is node + zcode.cjs app-server --stdio with the required env', async
   assert.deepEqual(childRef.spawnArgs, [ZCODE_CJS, 'app-server', '--stdio'])
   assert.equal(childRef.spawnOpts.env.ZCODE_HOME, 'F:/fake/home')
 })
+
+test('terminal envelope where the kind sits in payload.kind resolves (session/event shape)', { timeout: 5_000 }, async () => {
+  // The kind word may arrive at `payload.kind` rather than `params.type`; a
+  // recognizer that only checks the top-level carriers would never see the
+  // terminal event and the turn would hang until the idle watchdog. The real
+  // timeout knob is covered elsewhere; the test timeout here is the guard
+  // against regressing into that hang.
+  const childRef = {}
+  const deps = makeDeps(childRef, (child) => ({
+    ...baseRespond(child),
+    'session/send': (req) => {
+      child.out(result(req.id, { turnId: 't' }))
+      child.out({ method: 'session/event', params: { sessionId: 'sess-1', seq: 1, payload: { kind: 'turn.completed', response: 'ok', resultType: 'success' } } })
+    },
+  }))
+  const res = await runZcodeAppServerTurn(deps, ACCOUNT, { providerId: 'p', modelId: 'm', reasoningLevel: 'low', prompt: 'x' })
+  assert.equal(res.terminal, 'success')
+  assert.equal(res.responseText, 'ok')
+})

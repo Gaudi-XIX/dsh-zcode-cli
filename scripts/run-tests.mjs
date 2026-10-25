@@ -75,6 +75,7 @@ const EXPECTED_TEST_FILES = [
   'parser.test.mjs',
   'process.test.mjs',
   'register.test.mjs',
+  'selection.test.mjs',
   'session.test.mjs',
 ]
 
@@ -87,7 +88,7 @@ const EXPECTED_TEST_FILES = [
  * `docs/dsh-provider-contract.md` and with the summary `node --test` prints.
  * Adding or removing a case means updating all three.
  */
-const EXPECTED_TEST_CASES = 161
+const EXPECTED_TEST_CASES = 171
 
 /**
  * Recursively collect `*.test.mjs` under the tests directory.

@@ -165,6 +165,9 @@ export function resolveNodeOptions(value: string | undefined): string {
   return merged.join(' ')
 }
 
+/** Shape a `passEnv` entry must have; anything else is dropped, never passed. */
+export const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+
 /**
  * Build the child environment from a closed allowlist.
  *
@@ -184,7 +187,7 @@ export function buildChildEnv(options: {
     if (value !== undefined && value.length > 0) env[key] = value
   }
   for (const key of options.passEnv ?? []) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+    if (!ENV_NAME_PATTERN.test(key)) continue
     const value = options.source[key]
     if (value !== undefined) env[key] = value
   }
