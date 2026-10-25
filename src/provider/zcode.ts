@@ -553,7 +553,12 @@ export class ZcodeAdapter extends LlmAdapter {
       logger: (record: unknown) => this.logger(record),
       timeoutMs: this.processConfig.timeoutMs,
       idleTimeoutMs: this.processConfig.idleTimeoutMs,
-      maxOutputBytes: this.processConfig.maxOutputBytes ?? 256 * 1024 * 1024,
+      // Deliberately NOT `this.processConfig.maxOutputBytes`: the 8MB schema
+      // default belongs to the one-shot `-p` JSON stream. The app-server route
+      // replays state/telemetry envelopes every turn and trips 8MB on long
+      // conversations (field report 2026-10-25, twice: "output exceeded
+      // 8388608 bytes"). Leaving this unset lets app-server's own 256MB valve
+      // apply — it guards a runaway child, not a turn budget.
     }
 
     const textParts: string[] = []
