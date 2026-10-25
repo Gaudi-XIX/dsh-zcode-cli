@@ -27,7 +27,28 @@ import { resolve } from 'node:path'
  * carries the new tag and this picks it up without a plugin change.
  */
 export function readRuntimeBuiltinRevisionTag(logDir?: string): string | undefined {
-  const directory = logDir ?? defaultRuntimeLogDir()
+  // The log scan reads up to three multi-megabyte files and this runs once per
+  // turn; a short TTL keeps a desktop upgrade visible within a minute without
+  // paying the scan every request. Explicit directories (tests) bypass the cache.
+  if (logDir === undefined) {
+    const now = Date.now()
+    if (tagCache !== undefined && now - tagCacheAt < TAG_CACHE_TTL_MS) return tagCache
+    const tag = scanRuntimeBuiltinRevisionTag(defaultRuntimeLogDir())
+    if (tag !== undefined) {
+      tagCache = tag
+      tagCacheAt = now
+    }
+    return tag
+  }
+  return scanRuntimeBuiltinRevisionTag(logDir)
+}
+
+const TAG_CACHE_TTL_MS = 60_000
+let tagCache: string | undefined
+let tagCacheAt = 0
+
+function scanRuntimeBuiltinRevisionTag(directory: string): string | undefined {
+  if (directory.length === 0) return undefined
   let names: string[]
   try {
     names = readdirSync(directory).sort().reverse().slice(0, 3)
