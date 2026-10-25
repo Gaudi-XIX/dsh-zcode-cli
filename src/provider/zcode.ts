@@ -469,6 +469,7 @@ export class ZcodeAdapter extends LlmAdapter {
         characters,
         zcodeSessionId,
         code: failure?.code,
+        ...(failure === undefined ? {} : { message: failure.message }),
         toolSchemas: options.tools?.length ?? 0,
         usage,
       })
