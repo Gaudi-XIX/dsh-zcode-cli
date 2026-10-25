@@ -142,7 +142,7 @@ import { ZcodeStreamParser, parseStdout, type ZcodeFrame, type ZcodeTokenUsage }
 import { buildZcodeAccountConfig, type ZcodeAccountConfig } from '../zcode/account-config.js'
 import { runZcodeAppServerTurn, type ZcodeAppServerDeps } from '../zcode/app-server.js'
 import { readZcodePlanToken } from '../zcode/credential.js'
-import { ZCODE_EFFORT_IDS } from '../selection.js'
+import { ZCODE_EFFORT_IDS, ZCODE_MODEL_IDS } from '../selection.js'
 
 /** Display name of the provider card; the route id is `providerInfo().id`. */
 export const ZCODE_PROVIDER_DISPLAY_NAME = 'ZCode'
@@ -521,6 +521,7 @@ export class ZcodeAdapter extends LlmAdapter {
         builtinPath: zcodeBuiltinPath(),
         accountType: 'bigmodel',
         mode: 'start-plan',
+        modelIds: ZCODE_MODEL_IDS,
       })
     } catch (error) {
       yield {

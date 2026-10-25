@@ -55,6 +55,8 @@ export interface BuildAccountConfigOptions {
   readonly mode: string
   /** Every revision must differ (monotonic string); defaults to a timestamp. */
   readonly revisionSeed?: string
+  /** Models the injected target provider advertises; defaults to the builtin list. */
+  readonly modelIds?: readonly string[] | undefined
   readonly readFile?: ((path: string) => string) | undefined
   readonly hash?: ((text: string) => string) | undefined
 }
@@ -129,6 +131,7 @@ export function buildZcodeAccountConfig(options: BuildAccountConfigOptions): Zco
   }
 
   const target = entries.find(entry => entry.accountType === options.accountType && entry.mode === options.mode)
+  const advertised = options.modelIds ?? target?.modelIds ?? []
   if (target === undefined) {
     throw new Error(`ZCODE_ACCOUNT_CONFIG_INVALID: no account provider for accountType=${options.accountType} mode=${options.mode}`)
   }
@@ -141,8 +144,11 @@ export function buildZcodeAccountConfig(options: BuildAccountConfigOptions): Zco
   const states: Record<string, { availability: 'available' | 'unavailable'; entitled: boolean; current: boolean; unavailableReason?: string }> = {}
   for (const entry of entries) {
     const on = entry.providerId === target.providerId
+    // The snapshot is ours, not a faithful copy of the builtin table: the target
+    // provider advertises exactly the models this adapter offers, so GLM-5.3 can
+    // run on the start plan even though the builtin table omits it.
     providers[entry.providerId] = on
-      ? { access: { type: 'zhipu-account', entitled: true }, builtinModelIds: [...entry.modelIds] }
+      ? { access: { type: 'zhipu-account', entitled: true }, builtinModelIds: [...advertised] }
       : { access: { type: 'zhipu-account', entitled: false } }
     states[entry.providerId] = on
       ? { availability: 'available', entitled: true, current: true }
