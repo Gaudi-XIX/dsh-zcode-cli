@@ -133,12 +133,16 @@ import {
   type ModelConfig,
   type ZcodeToolPolicy,
 } from './config.js'
-import { ZcodeError, boundDiagnostic, isZcodeError } from './error-codes.js'
+import { ZcodeError, boundDiagnostic, isZcodeError, isZcodeErrorCode } from './error-codes.js'
 import { QUOTA_PROVIDER_CODE, recordQuotaObservation } from '../diagnostics.js'
 import { FileSessionStore, sessionStorePath } from '../session/file-store.js'
 import { SessionRegistry } from '../session/store.js'
 import { runZcode, type ZcodeProcessConfig } from '../zcode/process.js'
 import { ZcodeStreamParser, parseStdout, type ZcodeFrame, type ZcodeTokenUsage } from '../zcode/parser.js'
+import { buildZcodeAccountConfig, type ZcodeAccountConfig } from '../zcode/account-config.js'
+import { runZcodeAppServerTurn, type ZcodeAppServerDeps } from '../zcode/app-server.js'
+import { readZcodePlanToken } from '../zcode/credential.js'
+import { ZCODE_EFFORT_IDS } from '../selection.js'
 
 /** Display name of the provider card; the route id is `providerInfo().id`. */
 export const ZCODE_PROVIDER_DISPLAY_NAME = 'ZCode'
@@ -416,6 +420,223 @@ export class ZcodeAdapter extends LlmAdapter {
   }
 
   // -------------------------------------------------------------------------
+  // Free-plan turn (app-server channel)
+  // -------------------------------------------------------------------------
+
+  /**
+   * One turn over the ZCode app-server (start-plan).
+   *
+   * The wire carries the same account providers the desktop client injects, so
+   * the CLI signs its own requests and no credential of this adapter ever
+   * leaves the machine. Frames project 1:1 onto StreamChunks: a thinking run
+   * opens a `reasoning` block before the text block, usage precedes finish,
+   * and every failure surfaces as the same DSH-visible codes the `-p` route
+   * uses.
+   */
+  private async *streamFreeTurn(
+    options: GenerateOptions,
+    conversationId: string | undefined,
+    shared: boolean,
+  ): AsyncGenerator<StreamChunk, void, void> {
+    const startedAt = Date.now()
+    const dataBaseDir = zcodeDataBaseDir()
+    const selection = this.getSelection?.()
+    const model = nonEmpty(options.model) ?? this.model
+    const effort = effortId(selection?.effort) ?? 'max'
+
+    const emitFinish = (
+      failure: LlmFailure | undefined,
+      usage: TokenUsage | undefined,
+      characters: number,
+      zcodeSessionId: string,
+    ): StreamChunk[] => {
+      this.logger({
+        kind: failure === undefined ? 'zcode.request.completed' : 'zcode.request.failed',
+        provider: this.provider,
+        model: this.model,
+        transport: 'app-server',
+        toolPolicy: this.toolPolicy,
+        sharedSession: shared,
+        conversationId,
+        purpose: options.purpose,
+        durationMs: Date.now() - startedAt,
+        characters,
+        zcodeSessionId,
+        code: failure?.code,
+        toolSchemas: options.tools?.length ?? 0,
+        usage,
+      })
+      const chunks: StreamChunk[] = []
+      if (usage !== undefined) chunks.push({ type: 'usage', usage })
+      chunks.push({
+        type: 'finish',
+        reason: failure === undefined ? { kind: 'stop' } : { kind: 'error', failure },
+      })
+      return chunks
+    }
+
+    // Admission first: the same refusals the `-p` route enforces, before any
+    // process exists. The free channel runs its own tools, so a dsh-owned
+    // schema list cannot be projected and is refused with the honest code.
+    if ((options.tools?.length ?? 0) > 0 && this.toolPolicy === 'dsh-owned') {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            code: 'UNSUPPORTED_TOOLS',
+            message: 'toolPolicy "dsh-owned" is not implemented on the free-plan app-server route: '
+              + `it cannot project ${options.tools?.length ?? 0} declared tool(s) back to DSH. `
+              + 'Use "zcode-owned" (ZCode runs its own tools) or "reject" (no tools).',
+          },
+        },
+      }
+      return
+    }
+    const unsupported = unsupportedOptions(options)
+    if (unsupported.length > 0) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            code: 'UNSUPPORTED_OPTION',
+            message: `ZCode 0.17.0's app-server turn has no place for ${unsupported.join(', ')}; `
+              + 'this adapter refuses the request instead of silently dropping the setting.',
+          },
+        },
+      }
+      return
+    }
+
+    const prompt = this.buildPrompt(options, false)
+    const recorded = shared && conversationId !== undefined ? this.sessions.get(conversationId) : undefined
+    const resumeSessionId = this.config.sessionMode === 'resume' && recorded !== undefined
+      ? recorded.sessionId
+      : undefined
+
+    let account: ZcodeAccountConfig
+    try {
+      account = buildZcodeAccountConfig({
+        builtinPath: zcodeBuiltinPath(),
+        accountType: 'bigmodel',
+        mode: 'start-plan',
+      })
+    } catch (error) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            code: 'ZCODE_ENV_MISSING',
+            message: 'The start-plan account table could not be built from the built-in provider config: '
+              + (error instanceof Error ? error.message : String(error)),
+          },
+        },
+      }
+      return
+    }
+
+    const appServerDeps: ZcodeAppServerDeps = {
+      nodePath: this.processConfig.nodePath,
+      zcodeCjsPath: this.processConfig.zcodeCjsPath,
+      env: freePlanEnv(),
+      workspacePath: await this.resolveCwd(conversationId) ?? '.',
+      workspaceKey: conversationId ?? 'adhoc',
+      planToken: () => readZcodePlanToken(dataBaseDir),
+      logger: (record: unknown) => this.logger(record),
+      timeoutMs: this.processConfig.timeoutMs,
+      idleTimeoutMs: this.processConfig.idleTimeoutMs,
+      maxOutputBytes: this.processConfig.maxOutputBytes,
+    }
+
+    const textParts: string[] = []
+    const reasoningParts: string[] = []
+    let usage: TokenUsage | undefined
+    let textOpen = false
+    let reasoningOpen = false
+    let blockIndex = 0
+    let zcodeSessionId = ''
+    let failure: LlmFailure | undefined
+
+    try {
+      const result = await runZcodeAppServerTurn(appServerDeps, account, {
+        providerId: account.providerId,
+        modelId: model,
+        reasoningLevel: effort,
+        prompt,
+        ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      })
+      zcodeSessionId = result.zcodeSessionId
+      if (shared && conversationId !== undefined && zcodeSessionId.length > 0) {
+        this.remember(conversationId, zcodeSessionId)
+      }
+      if (result.terminal !== 'success' && result.errorCode === undefined) {
+        failure = { code: 'ZCODE_UNKNOWN', message: 'ZCode app-server turn failed without an error code' }
+      } else if (result.terminal !== 'success') {
+        failure = {
+          code: result.errorCode !== undefined && isZcodeErrorCode(result.errorCode) ? result.errorCode : 'ZCODE_UNKNOWN',
+          message: result.errorMessage ?? 'ZCode app-server turn failed',
+        }
+      }
+      for (const frame of result.frames) {
+        const text = frame.text
+        if (frame.kind === 'thinking' && typeof text === 'string' && text.length > 0) {
+          if (!reasoningOpen) {
+            reasoningOpen = true
+            yield { type: 'block-start', index: blockIndex, blockType: 'reasoning' }
+          }
+          reasoningParts.push(text)
+          yield { type: 'text-delta', index: blockIndex, text }
+        } else if (frame.kind === 'text' && typeof text === 'string' && text.length > 0) {
+          if (reasoningOpen) {
+            reasoningOpen = false
+            yield { type: 'block-end', index: blockIndex, block: { type: 'reasoning', text: reasoningParts.join('') } }
+            blockIndex += 1
+          }
+          if (!textOpen) {
+            textOpen = true
+            yield { type: 'block-start', index: blockIndex, blockType: 'text' }
+          }
+          textParts.push(text)
+          yield { type: 'text-delta', index: blockIndex, text }
+        } else if (frame.kind === 'usage' && frame.usage !== undefined) {
+          usage = {
+            inputTokens: frame.usage.inputTokens,
+            outputTokens: frame.usage.outputTokens,
+            ...(frame.usage.totalTokens === undefined ? {} : { totalTokens: frame.usage.totalTokens }),
+            ...(frame.usage.cacheReadTokens === undefined ? {} : { cacheReadTokens: frame.usage.cacheReadTokens }),
+            ...(frame.usage.cacheCreationTokens === undefined ? {} : { cacheWriteTokens: frame.usage.cacheCreationTokens }),
+          }
+        } else if (frame.kind === 'error') {
+          failure ??= {
+            code: frame.errorCode !== undefined && isZcodeErrorCode(frame.errorCode) ? frame.errorCode : 'ZCODE_UNKNOWN',
+            message: frame.errorMessage ?? 'ZCode app-server reported an error',
+          }
+        }
+      }
+    } catch (error) {
+      if (error instanceof ZcodeError) failure = toLlmFailure(error)
+      else {
+        failure = {
+          code: 'ZCODE_UNKNOWN',
+          message: boundDiagnostic(`ZCode app-server turn failed: ${error instanceof Error ? error.message : String(error)}`),
+        }
+      }
+    }
+
+    if (reasoningOpen) {
+      yield { type: 'block-end', index: blockIndex, block: { type: 'reasoning', text: reasoningParts.join('') } }
+      blockIndex += 1
+    }
+    if (textOpen) {
+      yield { type: 'block-end', index: blockIndex, block: { type: 'text', text: textParts.join('') } }
+    }
+    for (const chunk of emitFinish(failure, usage, textParts.join('').length, zcodeSessionId)) yield chunk
+  }
+
+  // -------------------------------------------------------------------------
   // Turn assembly
   // -------------------------------------------------------------------------
 
@@ -424,6 +645,15 @@ export class ZcodeAdapter extends LlmAdapter {
     conversationId: string | undefined,
     shared: boolean,
   ): AsyncGenerator<StreamChunk, void, void> {
+    // Free plan runs on the app-server channel: the CLI signs start-plan
+    // requests itself once the account providers are injected in-process, so
+    // no token or key of ours travels on the wire. Paid (and the default) keep
+    // the one-shot `-p` subprocess, whose self-signing comes from the
+    // personal provider config the CLI reads on its own.
+    if (nonEmpty(this.getSelection?.()?.plan) === 'free') {
+      yield* this.streamFreeTurn(options, conversationId, shared)
+      return
+    }
     const startedAt = Date.now()
     const parser = new ZcodeStreamParser()
     const queue: ZcodeFrame[] = []
@@ -1063,3 +1293,54 @@ function nonEmpty(value: string | undefined): string | undefined {
 
 /** Re-export so consumers of this module need one import for the error type. */
 export { ZcodeError, isZcodeError }
+
+// ---------------------------------------------------------------------------
+// Free-plan wiring helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * The data root the app-server child must share with the CLI's own state:
+ * `ZCODE_DATA_BASE_DIR`, resolved against the same contract the spawn layer
+ * enforces. Empty means the host never supplied the variable, which the
+ * credential reader will surface as `ZCODE_CREDENTIAL_MISSING` at request
+ * time — an honest late failure beats guessing a path.
+ */
+function zcodeDataBaseDir(): string {
+  return nonEmpty(process.env['ZCODE_DATA_BASE_DIR']) ?? nonEmpty(process.env['ZCODE_DATA_BASE_DIR'.toLowerCase()]) ?? ''
+}
+
+/**
+ * The built-in provider table the account injection is built from. This must
+ * be the canonical resource path — the runtime-cached copy under
+ * `runtime/provider/…` silently no-ops the injection (probe evidence
+ * 2026-10-25), and the spawn contract already pins the resource location.
+ */
+function zcodeBuiltinPath(): string {
+  return nonEmpty(process.env['ZCODE_BUILTIN_PROVIDER_CONFIG_FILE'])
+    ?? 'F:\\AgentData\\zcode\\cli\\resources\\config\\provider\\zcode-builtin.json'
+}
+
+/**
+ * Environment for the app-server child: the same contract values the `-p`
+ * route checks, passed explicitly because the injected account table must
+ * point at the canonical builtin path (not the runtime cache) for the
+ * injection to reach the provider registry.
+ */
+function freePlanEnv(): Readonly<Record<string, string>> {
+  const env: Record<string, string> = {}
+  const pick = (name: string): void => {
+    const value = nonEmpty(process.env[name])
+    if (value !== undefined) env[name] = value
+  }
+  pick('ZCODE_HOME')
+  pick('ZCODE_DATA_BASE_DIR')
+  pick('ZCODE_PERSONAL_PROVIDER_CONFIG_FILE')
+  pick('ZCODE_BUILTIN_PROVIDER_CONFIG_FILE')
+  pick('NODE_OPTIONS')
+  return env
+}
+
+/** The card's effort pick, narrowed to a known upstream id. */
+function effortId(value: string | undefined): string | undefined {
+  return typeof value === 'string' && (ZCODE_EFFORT_IDS as readonly string[]).includes(value) ? value : undefined
+}

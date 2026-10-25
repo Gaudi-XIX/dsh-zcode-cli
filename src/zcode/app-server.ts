@@ -363,7 +363,12 @@ class AppServerSession {
     // envelope: v4/telemetry/event …) or at `params.payload.kind` (session/event
     // streaming). Read both.
     const paramsKind = (params as { kind?: unknown }).kind
-    const kind = typeof paramsKind === 'string' && paramsKind.length > 0 ? paramsKind : payload.kind
+    let kind = typeof paramsKind === 'string' && paramsKind.length > 0 ? paramsKind : payload.kind
+    // `v4/telemetry/event` names the event in `params.type`, not `kind`
+    // (live capture 2026-10-25: kind/status sit at the params top level there).
+    if ((kind === undefined || kind === null) && typeof params.type === 'string' && params.type.startsWith('turn.')) {
+      kind = params.type
+    }
 
     // Terminal: the CLI emits a turn.terminal event whose kind/status sit at the
     // envelope top level (v4/telemetry/event) or inside `payload` (session/event
@@ -374,7 +379,7 @@ class AppServerSession {
       || params.type === 'turn.completed'
       || params.type === 'turn.failed'
     if (isTerminal) {
-      const rawStatus = firstString(payload.status, params.status)
+      const rawStatus = firstString(payload.status, params.status, payload.resultType)
       const status: 'success' | 'failed' = rawStatus === 'success' ? 'success' : 'failed'
       const payloadError = payload.error
       const errorCode = firstString(payload.errorCode, params.errorCode, payloadError?.code, payloadError?.type)
@@ -383,6 +388,38 @@ class AppServerSession {
         status,
         ...(errorCode === undefined ? {} : { errorCode }),
         ...(errorMessage === undefined ? {} : { errorMessage }),
+      }
+      // The session/event terminal carries the provider usage in its payload
+      // (live capture: `{usage:{inputTokens,outputTokens,totalTokens,…}}`); the
+      // telemetry envelope carries only a token total. Prefer the detailed one.
+      const u = payload.usage
+      if (u !== null && typeof u === 'object') {
+        const rec = u as Record<string, unknown>
+        const inputTokens = typeof rec['inputTokens'] === 'number' ? rec['inputTokens'] : 0
+        const outputTokens = typeof rec['outputTokens'] === 'number' ? rec['outputTokens'] : 0
+        const totalTokens = typeof rec['totalTokens'] === 'number' ? rec['totalTokens'] : undefined
+        const cacheReadTokens = typeof rec['cacheReadTokens'] === 'number' ? rec['cacheReadTokens'] : undefined
+        const cacheWriteTokens = typeof rec['cacheWriteTokens'] === 'number' ? rec['cacheWriteTokens'] : undefined
+        if (inputTokens > 0 || outputTokens > 0) {
+          this.frames.push({
+            kind: 'usage',
+            usage: {
+              inputTokens,
+              outputTokens,
+              ...(totalTokens === undefined ? {} : { totalTokens }),
+              ...(cacheReadTokens === undefined ? {} : { cacheReadTokens }),
+              ...(cacheWriteTokens === undefined ? {} : { cacheCreationTokens: cacheWriteTokens }),
+            },
+          })
+        } else {
+          const tokenCount = typeof payload.tokenCount === 'number' ? payload.tokenCount
+            : typeof (params as { tokenCount?: unknown }).tokenCount === 'number'
+              ? (params as { tokenCount: number }).tokenCount
+            : undefined
+          if (tokenCount !== undefined && tokenCount > 0) {
+            this.frames.push({ kind: 'usage', usage: { inputTokens: 0, outputTokens: tokenCount, totalTokens: tokenCount } })
+          }
+        }
       }
       return
     }

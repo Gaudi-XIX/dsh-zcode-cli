@@ -192,6 +192,37 @@ test('callbacks: requestProviderRuntimeHeaders returns the JWT + fixed headers; 
   assert.equal(prefsReply.result.modelContextBudgetStrategy, 'preflight-v1')
 })
 
+test('both live terminal envelopes resolve to success', async () => {
+  // Envelope (a): v4/telemetry/event — kind/status at params top level.
+  {
+    const childRef = {}
+    const deps = makeDeps(childRef, (child) => ({
+      ...baseRespond(child),
+      'session/send': (req) => {
+        child.out(result(req.id, { turnId: 't' }))
+        child.out({ method: 'v4/telemetry/event', params: { kind: 'turn.terminal', status: 'success', resultType: 'success', durationMs: 6504, tokenCount: 28555, toolCallCount: 0 } })
+      },
+    }))
+    const res = await runZcodeAppServerTurn(deps, ACCOUNT, { providerId: 'p', modelId: 'm', reasoningLevel: 'low', prompt: 'x' })
+    assert.equal(res.terminal, 'success')
+  }
+  // Envelope (b): session/event + type:'turn.completed', success in payload.resultType.
+  {
+    const childRef = {}
+    const deps = makeDeps(childRef, (child) => ({
+      ...baseRespond(child),
+      'session/send': (req) => {
+        child.out(result(req.id, { turnId: 't' }))
+        child.out(event('sess-1', 'turn.completed', { response: 'ok', resultType: 'success', tokenCount: 10, usage: { source: 'provider', modelRequestCount: 1, inputTokens: 8, outputTokens: 2, totalTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } }))
+      },
+    }))
+    const res = await runZcodeAppServerTurn(deps, ACCOUNT, { providerId: 'p', modelId: 'm', reasoningLevel: 'low', prompt: 'x' })
+    assert.equal(res.terminal, 'success')
+    const usage = res.frames.find((f) => f.kind === 'usage')
+    assert.ok(usage, 'usage frame present')
+  }
+})
+
 test('thinking deltas become kind=thinking frames; terminal failure carries error fields', async () => {
   const childRef = {}
   const deps = makeDeps(childRef, (child) => ({
