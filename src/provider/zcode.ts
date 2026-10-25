@@ -480,23 +480,32 @@ export class ZcodeAdapter extends LlmAdapter {
       return chunks
     }
 
-    // Admission first: the same refusals the `-p` route enforces, before any
-    // process exists. The free channel runs its own tools, so a dsh-owned
-    // schema list cannot be projected and is refused with the honest code.
-    if ((options.tools?.length ?? 0) > 0 && this.toolPolicy === 'dsh-owned') {
+    // Admission: `reject` still refuses up front (that is what the policy asks
+    // for). `dsh-owned` cannot be projected back on this route, so it degrades
+    // to the closest honourable behaviour: the schemas are dropped and ZCode
+    // runs its own tools, with one honest warning line per turn. Silently
+    // pretending DSH tools were available would answer a different request.
+    const toolCount = options.tools?.length ?? 0
+    if (toolCount > 0 && this.toolPolicy === 'reject') {
       yield {
         type: 'finish',
         reason: {
           kind: 'error',
           failure: {
             code: 'UNSUPPORTED_TOOLS',
-            message: 'toolPolicy "dsh-owned" is not implemented on the free-plan app-server route: '
-              + `it cannot project ${options.tools?.length ?? 0} declared tool(s) back to DSH. `
-              + 'Use "zcode-owned" (ZCode runs its own tools) or "reject" (no tools).',
+            message: `toolPolicy "reject" refuses ${toolCount} declared tool schema(s) on the free-plan route. `
+              + 'Use "zcode-owned" or "dsh-owned" (which degrades to zcode-owned here) to proceed.',
           },
         },
       }
       return
+    }
+    if (toolCount > 0 && this.toolPolicy === 'dsh-owned') {
+      this.logger({
+        kind: 'zcode.free-plan.degraded',
+        detail: `dsh-owned cannot project tool calls on the app-server route; ${toolCount} schema(s) dropped, `
+          + 'ZCode runs its own tools for this turn (zcode-owned semantics)',
+      })
     }
     // DSH web sends default temperature/maxTokens on every turn (agy.ts hit the
     // same wall and resolved it by continuing with CLI defaults instead of
@@ -566,6 +575,14 @@ export class ZcodeAdapter extends LlmAdapter {
       zcodeSessionId = result.zcodeSessionId
       if (shared && conversationId !== undefined && zcodeSessionId.length > 0) {
         this.remember(conversationId, zcodeSessionId)
+      }
+      // Short turns can skip `model.streaming` entirely; the terminal event's
+      // `response` field is then the only text source.
+      if (result.responseText !== undefined && result.responseText.length > 0 && !textOpen) {
+        textOpen = true
+        yield { type: 'block-start', index: blockIndex, blockType: 'text' }
+        textParts.push(result.responseText)
+        yield { type: 'text-delta', index: blockIndex, text: result.responseText }
       }
       if (result.terminal !== 'success' && result.errorCode === undefined) {
         failure = { code: 'ZCODE_UNKNOWN', message: 'ZCode app-server turn failed without an error code' }

@@ -76,6 +76,8 @@ export interface ZcodeAppServerTurnResult {
   readonly frames: readonly ZcodeAppServerFrame[]
   readonly zcodeSessionId: string
   readonly terminal: 'success' | 'failed'
+  /** Final assistant text from the terminal event (short turns skip streaming). */
+  readonly responseText?: string | undefined
   readonly errorCode?: string
   readonly errorMessage?: string
 }
@@ -175,7 +177,7 @@ class AppServerSession {
   sessionId: string | undefined
   thoughtLevels: string[] = []
   available: { providerId: string; modelId: string }[] = []
-  terminal: { status: 'success' | 'failed'; errorCode?: string; errorMessage?: string } | undefined
+  terminal: { status: 'success' | 'failed'; errorCode?: string; errorMessage?: string; responseText?: string } | undefined
 
   private nextId = 1
   private stdoutBuffer = ''
@@ -384,10 +386,17 @@ class AppServerSession {
       const payloadError = payload.error
       const errorCode = firstString(payload.errorCode, params.errorCode, payloadError?.code, payloadError?.type)
       const errorMessage = firstString(payload.errorMessage, params.errorMessage, payloadError?.message)
+      // `session/event`'s terminal carries the final assistant text in
+      // `payload.response` (live capture: "response":"pong"); short turns can
+      // skip `model.streaming` entirely, so this is their only text source.
+      const responseText = typeof payload.response === 'string' && payload.response.length > 0
+        ? payload.response
+        : undefined
       this.terminal = {
         status,
         ...(errorCode === undefined ? {} : { errorCode }),
         ...(errorMessage === undefined ? {} : { errorMessage }),
+        ...(responseText === undefined ? {} : { responseText }),
       }
       // The session/event terminal carries the provider usage in its payload
       // (live capture: `{usage:{inputTokens,outputTokens,totalTokens,…}}`); the
@@ -634,6 +643,7 @@ export async function runZcodeAppServerTurn(
       terminal: terminal.status,
       ...(terminal.errorCode === undefined ? {} : { errorCode: terminal.errorCode }),
       ...(terminal.errorMessage === undefined ? {} : { errorMessage: terminal.errorMessage }),
+      ...(terminal.responseText === undefined ? {} : { responseText: terminal.responseText }),
     }
   } finally {
     session.close()
