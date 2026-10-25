@@ -1,6 +1,6 @@
 {
   "name": "dsh-zcode-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "publishConfig": {
     "access": "public"
@@ -69,5 +69,13 @@
     "dsh",
     "dsh-provider",
     "zcode"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gaudi-XIX/dsh-zcode-provider.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Gaudi-XIX/dsh-zcode-provider/issues"
+  },
+  "homepage": "https://github.com/Gaudi-XIX/dsh-zcode-provider#readme"
 }

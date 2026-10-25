@@ -19,6 +19,13 @@ DSH 生态里接第三方模型的插件，本质差异只有一个问题：**�
 
 **为什么本插件是「CLI 主导」而不是 agy 那种「DSH 主导」——这是上游接口决定的，不是实现取舍。** AGY CLI 暴露了 stream-json 事件协议和结构化 tool-call 信封，所以 agy 插件能把 DSH 的工具 schema 投影进去、把模型要调的工具拦截下来交回 DSH 执行。ZCode 0.17.0 没有这种通道：它只卖「跑一轮任务」（`-p` 一次性 / app-server 会话），不卖裸模型接口，也不吐工具投影；模型额度又绑定在官方二进制的签名通道上，HTTP 直连会被风控打回。**接口没开的门，插件侧任何实现都变不出来。** 所以本插件的形态是：整轮任务委托给 ZCode，DSH 做好的那一层壳（会话组织、重试、超时、错误分类、UI、随时切走）。
 
+### 与市场同类的对照
+
+DSH 市场里已有两条同走官方 CLI 委托路线的 ZCode 插件，都是认真维护的作品，收录本插件前先说清它们为什么不同：
+
+- [`dsh-zcode-cli-proxy`](https://github.com/kyle123740/dsh-zcode-cli-proxy) / [`dsh-zcode-plan-bridge`](https://github.com/tangyixiao/dsh-zcode-plan-bridge)：单路线常驻 app-server（Start Plan 账号注入），真流式，跟进 ZCode CLI 新版（3.16.x）与 DSH 0.2.1 更激进。**适合想让 ZCode 会话常驻、跟进新 CLI 的用户。**
+- **本插件**锚定已实测的 ZCode 0.17.0 + DSH 0.2.0-rc.2，做的是另一件事：**付费（`-p` 一次性）与免费（app-server 注入）双路线**，且把两条路线的行为逐一对齐（resume 语义、死会话自愈、准入检查、错误码），以 171 例 node --test 测试和三处计数的门禁锁死，每条行为有契约文档（`docs/dsh-provider-contract.md`）背书。**适合要付费/免费可切、看重可测契约与 fail-closed 语义的用户。**
+
 ## 优势（这套设计换来什么）
 
 - **零风控**：只走官方 CLI 的签名通道，不触碰任何可被识别为「非官方客户端」的行为。
