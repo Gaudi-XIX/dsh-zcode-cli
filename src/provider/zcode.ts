@@ -553,7 +553,7 @@ export class ZcodeAdapter extends LlmAdapter {
       logger: (record: unknown) => this.logger(record),
       timeoutMs: this.processConfig.timeoutMs,
       idleTimeoutMs: this.processConfig.idleTimeoutMs,
-      maxOutputBytes: this.processConfig.maxOutputBytes,
+      maxOutputBytes: this.processConfig.maxOutputBytes ?? 256 * 1024 * 1024,
     }
 
     const textParts: string[] = []

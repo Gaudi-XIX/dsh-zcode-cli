@@ -132,7 +132,11 @@ interface PendingRequest {
 
 const DEFAULT_TIMEOUT_MS = 180_000
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000
-const DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024
+// 256MB: with a long DSH conversation the app-server replays sizable
+// `session/updated` / telemetry envelopes every turn; the 8MB process-era cap
+// killed real turns (2026-10-25 field report "output exceeded 8388608 bytes").
+// This valve only exists against a runaway child, not as a turn budget.
+const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024 * 1024
 const READY_POLL_INTERVAL_MS = 250
 const READY_POLL_ATTEMPTS = 60
 const READY_POLL_TIMEOUT_MS = 800
