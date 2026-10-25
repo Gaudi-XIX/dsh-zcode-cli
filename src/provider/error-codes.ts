@@ -48,6 +48,12 @@ export const ZCODE_ERROR_CODES = [
   'ZCODE_OUTPUT_TOO_LARGE',
   /** The host could not resolve a workspace root for the session; nothing was spawned. */
   'WORKSPACE_UNAVAILABLE',
+  /** The ZCode credentials file is missing or unreadable; no token was read. */
+  'ZCODE_CREDENTIAL_MISSING',
+  /** The credentials file has no usable `zcodejwttoken` of the `enc:v1:` shape. */
+  'ZCODE_CREDENTIAL_INVALID',
+  /** The stored credential could not be decrypted (key/IV/tag/GCM failure). */
+  'ZCODE_CREDENTIAL_DECRYPT_FAILED',
 ] as const
 
 export type ZcodeErrorCode = typeof ZCODE_ERROR_CODES[number]

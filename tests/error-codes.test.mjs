@@ -47,9 +47,9 @@ date: 'Fri, 23 Oct 2026 17:12:35 GMT', 'x-process-time': '0.298755'`
 const RATE_LIMIT_STDERR = 'ProviderBusinessError: [3007][请求过于频繁，请稍后重试][2026102401123552bbdbe6a99a4f3e]'
 const PERMISSION_STDERR = 'ProviderBusinessError: [3012][unusual activity detected][2026102401123552bbdbe6a99a4f3f]'
 
-test('ZCODE_ERROR_CODES is the frozen list of 17 unique string codes', () => {
-  assert.equal(ZCODE_ERROR_CODES.length, 17)
-  assert.equal(new Set(ZCODE_ERROR_CODES).size, 17)
+test('ZCODE_ERROR_CODES is the frozen list of 20 unique string codes', () => {
+  assert.equal(ZCODE_ERROR_CODES.length, 20)
+  assert.equal(new Set(ZCODE_ERROR_CODES).size, 20)
   for (const code of ZCODE_ERROR_CODES) {
     assert.equal(typeof code, 'string')
     assert.match(code, /^[A-Z][A-Z0-9_]*$/)
@@ -69,6 +69,10 @@ test('ZCODE_ERROR_CODES is the frozen list of 17 unique string codes', () => {
     'ZCODE_OUTPUT_TOO_LARGE',
     'WORKSPACE_UNAVAILABLE',
   ]) {
+    assert.ok(ZCODE_ERROR_CODES.includes(code), `missing ${code}`)
+  }
+  // The app-server channel needs the three credential codes.
+  for (const code of ['ZCODE_CREDENTIAL_MISSING', 'ZCODE_CREDENTIAL_INVALID', 'ZCODE_CREDENTIAL_DECRYPT_FAILED']) {
     assert.ok(ZCODE_ERROR_CODES.includes(code), `missing ${code}`)
   }
   assert.equal(isZcodeErrorCode('NOT_A_CODE'), false)
