@@ -7,12 +7,12 @@
  * small: a session-based server (one session per client conversation) over
  * newline delimited JSON-RPC 2.0.
  *
- * Wire compatibility notes inherited from the AGY integration (measured against
- * AGY 1.3.2) and **not** re-verified against ZCode — ZCode's MCP client was
- * never reached on this machine (see `docs/zcode-a3-tool-bridge.md`), so treat
- * these as the starting hypothesis, not as measured ZCode behaviour:
- * - the negotiated protocol version is echoed back from the client, because
- *   AGY rejects a server that answers with a version it did not offer;
+ * Wire behaviour, as measured on this machine against ZCode's MCP client (the
+ * A3 probe run, see `docs/dsh-provider-contract.md`). These are the rules the
+ * server holds to, not preferences:
+ * - the negotiated protocol version is echoed back from the client: a client
+ *   that asks for one of `MCP_SUPPORTED_PROTOCOL_VERSIONS` must not be answered
+ *   with a version it did not offer;
  * - a JSON-RPC *notification* (no `id`) must never be answered;
  * - tool failures travel as a normal `tools/call` result with `isError: true`
  *   so the model can react to them instead of seeing a transport error.

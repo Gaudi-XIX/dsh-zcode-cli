@@ -245,7 +245,7 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 - 槽位 props 只有 `{ provider, configured, keyConfigured }`，**不含配置本体**（配置在同一个槽的兄弟表单里）。卡片上半部分是**运行配置块**（套餐 / 模型 / 推理强度三个 `<select>`，读写插件自己的 loopback state 路由），下半部分是**只读信息面板**：路由 / 命名空间 / 模型目录 / 随包默认值（`sessionMode` / `toolPolicy` / `mode` / `imageInput`）/ CLI 入口（`node` 与 `zcode.cjs` 绝对路径）/ 环境契约五变量。除该 state 路由外，卡片不读写宿主配置，也不碰任何 ZCode 文件。
 - state 路由契约：`GET`/`POST /plugins/dsh-zcode-cli/state`（`ZCODE_STATE_ROUTE_PATH`，`src/web/router.ts`；客户端字面量 `STATE_PATH`，`tests/client.test.mjs` 钉住两者相等）。成功信封 `{ ok: true, state: { plan, model, effort, plans[], models[], efforts[] }, error: null }`；失败 `{ ok: false, error: { code, message } }`；无法识别的值回 `400` + `error.code = 'INVALID_SELECTION'`。客户端 `readSelectionEnvelope()` 只接受 `ok === true` 且 `state` 齐备，否则渲染成一行失败提示而不是静默空白。
 - 选项语义：`plans` 两个（`free` 免费套餐 / `paid` 付费套餐）。`plan` **决定传输路线**（`free`＝app-server 注入通道，其余＝一次性 `-p`）；在 `-p` 路线内部它不改变 argv。`model` 与 `effort` 在 `-p` 路线不改变 argv——0.17.0 的 CLI 没有 `--model` / `--effort` 旗标（免费路线里两者经 `session/send` 的 `modelSelection` 真实下发）。selection 的作用是**让卡片的选择与守卫一致**：请求模型与选择模型或配置默认模型都不相等时才 `MODEL_NOT_FOUND` 且不 spawn。
-- 样式：`client/styles.ts` 导出 `ZC_CSS`，由卡片在渲染树里 `h('style', null, ZC_CSS)` 注入；下拉样式照抄 `F:\defws\dsh-agy-provider\client\index.ts` 的 `.agy-select`（改名 `zc-select`，连同 `:root` 亮/暗色变量与 `.zc-btn`），这是用户明确要求「参考我已经做好的，不要自己造轮子」的落点。
+- 样式：`client/styles.ts` 导出 `ZC_CSS`，由卡片在渲染树里 `h('style', null, ZC_CSS)` 注入；全部类名带 `zc-` 前缀，颜色一律走 `--zc-*` 变量（亮/暗色由变量组切换），因此不会渗进宿主设置页。
 - Hook 纪律：`useState` / `useEffect` 只在组件上方的 `useTranslation()` 与 `useSelection()` 里，组件函数体**只有两句 hook（都在首行区）、只有一个 return**。宿主用 `SlotErrorBoundary` 包住槽内容，渲染期抛异常会渲染成空元素——hook 在条件 return 之后导致 hook 数变化时，症状与本卡片要修的空白行一模一样。`tests/client.test.mjs` 把这条结构钉住。
 - 漂移防线：卡片不能 import `src/provider/config.ts`（会拖入 schemastery 与适配器模块图，浏览器侧无法解析），所以模型目录、默认值与环境契约是**手抄字面量**；`tests/client.test.mjs` 逐项与 `src/` 和 `cordis.patch.yml` 比对，任一侧改了没同步就判红。
 
@@ -255,7 +255,7 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 
 测试面：`tests/` 下递归共 **15** 个 `*.test.mjs`，必须与脚本里的 `EXPECTED_TEST_FILES` 集合相等，也必须等于本行声明的数字（`declaredTestCount()` 解析本行）。少一个、多一个、改名一个都会让门禁在跑测试前就停——不允许「测试变少、门禁仍绿」。
 
-测试用例：`node --test` 汇总的用例总数共 **193** 个（`ℹ tests 193`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
+测试用例：`node --test` 汇总的用例总数共 **194** 个（`ℹ tests 194`），必须与脚本里的 `EXPECTED_TEST_CASES` 相等，也必须等于本行声明的数字（`declaredCaseCount()` 解析本行）。文件清单看不见文件内部：删掉一个 `test()` 块，剩下的用例照样全绿，所以用例数要单独锁一次——门禁读到 `ℹ tests` 的数字与本行不符时直接判红。
 
 受控文件：`git ls-files` 共 **49** 个 = 22 个 `src/**` 源文件（`index.ts`、`diagnostics.ts`、`doctor.ts`、`selection.ts`、`mcp/{bridge,endpoint,protocol,tool-projection}.ts`、`provider/{config,error-codes,tool-protocol,zcode}.ts`、`session/{file-store,store}.ts`、`web/router.ts`、`zcode/{account-config,app-server,credential,parser,prefix,process}.ts`）+ 3 个 `client/` 源文件（`index.ts`、`locales.ts`、`styles.ts`）+ 15 个 `tests/**/*.test.mjs` + 3 个 `scripts/`（`run-tests.mjs`、`build-client.mjs`、`install-env.ps1`）+ 1 个 `docs/dsh-provider-contract.md` + 6 个根级文件（`.gitignore`、`README.md`、`cordis.patch.yml`、`package.json`、`tsconfig.json`、`tsconfig.client.json`）。门禁会拿 `git ls-files` 的实点数与这一行比对，改文件数必须同步改这行。
 

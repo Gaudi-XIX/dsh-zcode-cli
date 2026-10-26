@@ -1,18 +1,16 @@
 /**
  * The schema half of the DSH tool protocol.
  *
- * Narrowed deliberately: the AGY adapter needs the whole structured-prompt
- * protocol (envelope rendering, argument matching, response parsing), while the
- * ZCode bridge only needs to put a DSH tool schema on an MCP wire. So this file
+ * Narrowed deliberately: a structured-prompt adapter needs the whole protocol
+ * (envelope rendering, argument matching, response parsing), while the ZCode
+ * bridge only needs to put a DSH tool schema on an MCP wire. So this file
  * carries exactly two things — the shared size limits and the schema
  * whitelist that decides which JSON Schema keywords are allowed through — and
  * nothing about prompts.
  *
  * The whitelist exists because MCP servers receive a client-supplied schema
  * verbatim: an unrestricted one is both a smuggling channel (`__proto__` keys
- * reach an object merge inside the host) and an unbounded token cost. Copied
- * from `dsh-agy-cli/src/provider/tool-protocol.ts`, which is the reference
- * implementation of this gate.
+ * reach an object merge inside the host) and an unbounded token cost.
  */
 
 /** Upper bounds for the provider-side structured tool protocol. */

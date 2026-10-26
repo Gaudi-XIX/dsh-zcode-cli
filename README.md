@@ -6,29 +6,29 @@ DSH 的 **safe provider**：把本机 ZCode CLI（`zcode.cjs`，ZCode 0.17.0）�
 
 1. **完全合规** ✓ —— 插件自己从不向上游发一个网络请求：所有流量由官方二进制自带 ed25519 签名发起；不碰 ZCode 的账号密码，不伪造客户端特征。零风控、零封号面。
 2. **吃到 ZCode 账号的官方额度** ✓ —— 付费套餐走官方签名通道；免费起步套餐经 app-server 账号注入，且注入层已**端到端激活**（对照官方桌面客户端的投递载荷修复了 canonical revision、connectionKey 与 runtime 上报的 builtin tag，实测模型可在免费套餐上跑完整轮次）。消耗与官方客户端同池同规则，不需要任何 API Key。
-3. **抛弃 ZCode 的 harness 换 DSH 的：MCP 工具桥已落地** ✓ —— 实测（probe5，2026-10-26）：免费套餐上的模型**可以经 MCP 桥调用工具**，与姊妹插件 dsh-agy-cli 的桥同构。v0.3.0 起插件内建 HTTP MCP 桥（loopback + bearer token 随机路径），把 DSH 的工具 schema 投影给模型、把工具调用交回 DSH 工具管线执行；`toolPolicy` 非 `dsh-owned` 或桥起不来时自动退回 CLI 主导形态。审批走 DSH 现役审批面（桥的执行带 Agent 句柄）；`toolAllowlist/toolDenylist` 为配置透传，语义未在本机实测验证。
+3. **抛弃 ZCode 的 harness 换 DSH 的：MCP 工具桥已落地** ✓ —— 实测（probe5，2026-10-26）：免费套餐上的模型**可以经 MCP 桥调用工具**。v0.3.0 起插件内建 HTTP MCP 桥（loopback + bearer token 随机路径），把 DSH 的工具 schema 投影给模型、把工具调用交回 DSH 工具管线执行；`toolPolicy` 非 `dsh-owned` 或桥起不来时自动退回 CLI 主导形态。审批走 DSH 现役审批面（桥的执行带 Agent 句柄）；`toolAllowlist/toolDenylist` 为配置透传，语义未在本机实测验证。
 
 ## 与其他服务商插件的区别（先读这个）
 
-DSH 生态里接第三方模型的插件，本质差异只有一个问题：**谁来当 harness**。harness 指「工具怎么执行、多步循环怎么走、上下文怎么管」这三件事。两个插件正好站在光谱两端：
+DSH 生态里接第三方模型的插件，本质差异只有一个问题：**谁来当 harness**。harness 指「工具怎么执行、多步循环怎么走、上下文怎么管」这三件事。三类插件正好站在光谱两端：
 
-| | [dsh-agy-cli](https://github.com/Gaudi-XIX/dsh-agy-cli)（姊妹插件） | **本插件（当前版本）** | 抽 token 反代类插件 |
+| | **本插件（当前版本）** | 自建 harness 类第三方 provider 插件 | 抽 token 反代类插件 |
 |---|---|---|---|
-| 模型额度来源 | AGY CLI 官方二进制 | ZCode CLI 官方二进制 | 逆向出的私token |
-| **harness 归属** | **DSH 100% 主导** | **v0.3.0 起工具执行归 DSH**（MCP 桥；整轮编排仍由 ZCode 驱动） | 插件自建 |
-| 工具执行 | DSH 工具管线（审批/沙箱全生效） | **DSH 工具管线**（MCP 桥回传；`dsh-owned` 时生效） | 插件自实现 |
+| 模型额度来源 | ZCode CLI 官方二进制 | 各自的官方 CLI 二进制 | 逆向出的私token |
+| **harness 归属** | **v0.3.0 起工具执行归 DSH**（MCP 桥；整轮编排仍由 ZCode 驱动） | DSH 主导 | 插件自建 |
+| 工具执行 | **DSH 工具管线**（MCP 桥回传；`dsh-owned` 时生效） | DSH 工具管线（审批/沙箱全生效） | 插件自实现 |
 | 网络请求 | 官方二进制签发 | 官方二进制签发 | 插件伪造客户端直连 |
 | 风控/封号面 | 无 | 无 | 有（如 ZCode 通道 `405 [3012]` 惩罚阶梯） |
-| DSH harness 增强（审批、沙箱、子代理、压缩） | **全部生效** | **审批生效**（MCP 桥带 Agent 句柄走 DSH 审批面）；沙箱/子代理/压缩仍未接 | 部分自实现 |
+| DSH harness 增强（审批、沙箱、子代理、压缩） | **审批生效**（MCP 桥带 Agent 句柄走 DSH 审批面）；沙箱/子代理/压缩仍未接 | 全部生效 | 部分自实现 |
 
-**为什么曾经是「CLI 主导」——旧判断与它的实测推翻。** AGY CLI 暴露了 stream-json 事件协议和结构化 tool-call 信封，所以 agy 插件能把 DSH 的工具 schema 投影进去、把模型要调的工具拦截下来交回 DSH 执行。本插件最初据此判断「ZCode 没有这种通道」：它只卖「跑一轮任务」（`-p` 一次性 / app-server 会话），不卖裸模型接口，额度又绑定官方签名通道。**这个判断已被实测推翻**（2026-10-26 probe5：免费套餐上的模型经 MCP 桥成功调用工具，与 agy 的桥同构）。**v0.3.0 起 MCP 工具桥已产品化**：插件把桥挂在自己的 loopback 路由上，经 `session/create` 的 `mcpServers` 参数注册给 ZCode（协议取自 `zcode.cjs` schema 取证，stdio/http 两形 union），DSH 工具经 HTTP 桥回传执行。`toolPolicy` 非 `dsh-owned`、或桥启动失败时，自动退回「整轮委托给 ZCode、DSH 只做壳层」的旧形态——桥的任何失败都是降级，不是报错。
+**为什么曾经是「CLI 主导」——旧判断与它的实测推翻。** 本插件最初判断「ZCode 不卖裸模型接口」：它只卖「跑一轮任务」（`-p` 一次性 / app-server 会话），额度又绑定官方签名通道，看起来没有把 DSH 工具 schema 投进去的通道。**这个判断已被实测推翻**（2026-10-26 probe5：免费套餐上的模型经 MCP 桥成功调用工具）。**v0.3.0 起 MCP 工具桥已产品化**：插件把桥挂在自己的 loopback 路由上，经 `session/create` 的 `mcpServers` 参数注册给 ZCode（协议取自 `zcode.cjs` schema 取证，stdio/http 两形 union），DSH 工具经 HTTP 桥回传执行。`toolPolicy` 非 `dsh-owned`、或桥启动失败时，自动退回「整轮委托给 ZCode、DSH 只做壳层」的旧形态——桥的任何失败都是降级，不是报错。
 
 ### 与市场同类的对照
 
 DSH 市场里已有两条同走官方 CLI 委托路线的 ZCode 插件，都是认真维护的作品，收录本插件前先说清它们为什么不同：
 
 - [`dsh-zcode-cli-proxy`](https://github.com/kyle123740/dsh-zcode-cli-proxy) / [`dsh-zcode-plan-bridge`](https://github.com/tangyixiao/dsh-zcode-plan-bridge)：单路线常驻 app-server（Start Plan 账号注入），真流式，跟进 ZCode CLI 新版（3.16.x）与 DSH 0.2.1 更激进。**适合想让 ZCode 会话常驻、跟进新 CLI 的用户。**
-- **本插件**锚定已实测的 ZCode 0.17.0 + DSH 0.2.0-rc.2，做的是另一件事：**付费（`-p` 一次性）与免费（app-server 注入）双路线**，且把两条路线的行为逐一对齐（resume 语义、死会话自愈、准入检查、错误码），以 193 例 node --test 测试和三处计数的门禁锁死，每条行为有契约文档（`docs/dsh-provider-contract.md`）背书。**适合要付费/免费可切、看重可测契约与 fail-closed 语义的用户。**
+- **本插件**锚定已实测的 ZCode 0.17.0 + DSH 0.2.0-rc.2，做的是另一件事：**付费（`-p` 一次性）与免费（app-server 注入）双路线**，且把两条路线的行为逐一对齐（resume 语义、死会话自愈、准入检查、错误码），以 194 例 node --test 测试和三处计数的门禁锁死，每条行为有契约文档（`docs/dsh-provider-contract.md`）背书。**适合要付费/免费可切、看重可测契约与 fail-closed 语义的用户。**
 
 ## 优势（这套设计换来什么）
 
@@ -70,7 +70,7 @@ DSH 市场里已有两条同走官方 CLI 委托路线的 ZCode 插件，都是�
 node scripts/run-tests.mjs    # AC11 行尾 → tsc --noEmit → build → tsc client → build:client → 包入口点 → 测试面计数 → node --test
 ```
 
-`tests/` 下 15 个 `*.test.mjs`；脚本里的显式清单、`docs/dsh-provider-contract.md` 的「测试面」计数与磁盘实点三者必须一致，否则门禁在跑测试前就停。用例总数同样锁死（193，`EXPECTED_TEST_CASES` 与文档「测试用例」行），删掉一个 `test()` 块也会让门禁变红。MCP 工具桥由 `tests/mcp-bridge.test.mjs` 覆盖（协议握手、loopback/token 门禁、schema 校验、agent 平面解析、fail-closed 降级）。免费路线由一个实现了 app-server 协议的 fake CLI 端到端覆盖（流式/短答/resume/死会话/准入），浏览器半边字面量由 `tests/client.test.mjs` 逐项钉住。
+`tests/` 下 15 个 `*.test.mjs`；脚本里的显式清单、`docs/dsh-provider-contract.md` 的「测试面」计数与磁盘实点三者必须一致，否则门禁在跑测试前就停。用例总数同样锁死（194，`EXPECTED_TEST_CASES` 与文档「测试用例」行），删掉一个 `test()` 块也会让门禁变红。MCP 工具桥由 `tests/mcp-bridge.test.mjs` 覆盖（协议握手、loopback/token 门禁、schema 校验、agent 平面解析、fail-closed 降级）。免费路线由一个实现了 app-server 协议的 fake CLI 端到端覆盖（流式/短答/resume/死会话/准入），浏览器半边字面量由 `tests/client.test.mjs` 逐项钉住。
 
 ## 已知限制（摘要）
 

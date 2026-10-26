@@ -1,10 +1,10 @@
 /**
  * The runtime half of the MCP bridge.
  *
- * Unlike the AGY bridge this file descends from, there is no config-file side:
- * ZCode takes its MCP servers as a `session/create` parameter, so the whole
- * registration is the descriptor this module hands to the app-server
- * (`mcpServers()`), and nothing is written to another application's disk.
+ * There is no config-file side: ZCode takes its MCP servers as a
+ * `session/create` parameter, so the whole registration is the descriptor this
+ * module hands to the app-server (`mcpServers()`), and nothing is written to
+ * another application's disk.
  *
  * This module owns the live half: the projected tool set, the loopback HTTP
  * endpoint on the host's `webServer` carrier, and the `tools/call` round-trip

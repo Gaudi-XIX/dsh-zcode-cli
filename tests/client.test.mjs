@@ -27,6 +27,7 @@ const read = relative => readFileSync(join(root, relative), 'utf8')
 const manifest = JSON.parse(read('package.json'))
 const clientEntry = read('client/index.ts')
 const clientLocales = read('client/locales.ts')
+const clientStyles = read('client/styles.ts')
 const nodeEntry = read('src/index.ts')
 const nodeConfig = read('src/provider/config.ts')
 const nodeProcess = read('src/zcode/process.ts')
@@ -186,4 +187,30 @@ test('the locale dictionaries cover the card strings and carry no dead billing k
   const zhKeys = [...zhBlock.matchAll(/^ {2}'([^']+)':/gmu)].map(match => match[1]).sort()
   const enKeys = [...enBlock.matchAll(/^ {2}'([^']+)':/gmu)].map(match => match[1]).sort()
   assert.deepEqual(enKeys, zhKeys, 'both dictionaries must carry the same key set')
+})
+
+test('the whole-card fold switch drives the group, and its label follows the group state', () => {
+  // One control for the four read-only blocks. It has to reach the folds by DOM
+  // walk (the card runs without refs) and it must not keep a click counter: the
+  // label is chosen by CSS from what the group actually shows, so a block the
+  // user opens by hand cannot leave "expand all" on screen next to an open block.
+  for (const key of ['card.fold.expandAll', 'card.fold.collapseAll']) {
+    assert.ok(clientEntry.includes(`t('${key}')`), `the switch renders ${key}`)
+  }
+  assert.match(clientEntry, /closest\.call\(target, '\.zc-fold-group'\)/u, 'the switch walks up to its group')
+  assert.match(clientEntry, /querySelectorAll\('details\.zc-fold'\)/u, 'and drives every fold in that group')
+  assert.ok(
+    !/\.reduce\(/u.test(clientEntry.slice(clientEntry.indexOf('function toggleFolds'), clientEntry.indexOf('function foldGroup'))),
+    'the switch writes the state it computes; it does not accumulate one',
+  )
+  assert.match(
+    clientStyles,
+    /\.zc-fold-group:not\(:has\(> details\.zc-fold:not\(\[open\]\)\)\) > \.zc-fold-bar \.zc-fold-collapse \{\s*display: inline;/u,
+    'the collapse label appears only when no fold is left closed',
+  )
+  assert.match(
+    clientStyles,
+    /\.zc-fold-switch > \.zc-fold-collapse \{\s*display: none;/u,
+    'and the expand label is the default, so a fully closed card offers "expand all"',
+  )
 })

@@ -377,6 +377,78 @@ function fold(title: string, children: readonly unknown[], open = false): unknow
 }
 
 /**
+ * The DOM slice the bulk switch touches. Typed structurally on purpose: this
+ * project's client tsconfig carries only `lib: ES2022` plus Node's types, so
+ * there is no DOM lib here and `HTMLDetailsElement` would not compile.
+ */
+interface FoldElement {
+  open: boolean
+}
+
+interface FoldGroup {
+  querySelectorAll(selector: string): ArrayLike<FoldElement>
+}
+
+/** Walk up from the clicked switch to the group that owns the folds. */
+function foldGroupOf(target: unknown): FoldGroup | null {
+  if (target === null || typeof target !== 'object') return null
+  const closest = (target as { closest?: unknown }).closest
+  if (typeof closest !== 'function') return null
+  const group = closest.call(target, '.zc-fold-group')
+  if (group === null || typeof group !== 'object') return null
+  const query = (group as { querySelectorAll?: unknown }).querySelectorAll
+  return typeof query === 'function' ? (group as FoldGroup) : null
+}
+
+/**
+ * One switch for all four read-only blocks: expand everything that is still
+ * closed, otherwise collapse everything.
+ *
+ * The live `open` flags are the only source of truth — mirroring them into
+ * React state would (a) add a hook to a component whose hooks order is pinned
+ * by a test, and (b) let the switch lie after the user clicks one title alone.
+ */
+function toggleFolds(target: unknown): void {
+  const group = foldGroupOf(target)
+  if (group === null) return
+  const folds = Array.from(group.querySelectorAll('details.zc-fold'))
+  const next = !folds.every(node => node.open)
+  for (const node of folds) node.open = next
+}
+
+/**
+ * The four read-only blocks plus their bulk switch.
+ *
+ * `<details>` owns its own state in the DOM, so the switch only has to find the
+ * group and write `open` on each block: no hook, no ref, and the card's
+ * single-exit / hooks-order contract stays exactly as it was.
+ *
+ * The switch label is chosen by CSS (`:has()` on the group), not by JS, so it
+ * stays true even when the user opens the blocks one at a time.
+ */
+function foldGroup(t: (key: ZcodeLocaleKey) => string, children: readonly unknown[]): unknown {
+  return h(
+    'div',
+    { className: 'zc-fold-group' },
+    h(
+      'div',
+      { className: 'zc-fold-bar' },
+      h(
+        'button',
+        {
+          type: 'button',
+          className: 'zc-fold-switch',
+          onClick: (event: { currentTarget?: unknown }) => toggleFolds(event.currentTarget),
+        },
+        h('span', { className: 'zc-fold-expand' }, t('card.fold.expandAll')),
+        h('span', { className: 'zc-fold-collapse' }, t('card.fold.collapseAll')),
+      ),
+    ),
+    ...children,
+  )
+}
+
+/**
  * The run-configuration block: plan, model and reasoning effort, each a
  * select that writes straight back to the state route.
  *
@@ -555,30 +627,32 @@ export function apply(ctx: ClientContext): void {
       row(t('card.route'), provider, true),
       row(t('card.ns'), SETTINGS_NS, true),
       h('div', { style: S.divider }),
-      fold(t('card.models'), [row(t('card.models.catalog'), modelLine)]),
-      fold(t('card.defaults'), [
-        row(t('card.defaults.model'), DEFAULT_MODEL, true),
-        row(t('card.defaults.sessionMode'), t('card.defaults.sessionMode.value')),
-        row(t('card.defaults.toolPolicy'), t('card.defaults.toolPolicy.value')),
-        row(t('card.defaults.mode'), t('card.defaults.mode.value')),
-        row(t('card.defaults.imageInput'), t('card.defaults.imageInput.value')),
-        h('span', { style: S.note }, t('card.defaults.source')),
-      ]),
-      h('div', { style: S.divider }),
-      fold(t('card.cli'), [
-        row(t('card.cli.node'), NODE_PATH, true),
-        row(t('card.cli.cjs'), ZCODE_CJS_PATH, true),
-      ]),
-      fold(t('card.env'), [
-        h('span', { style: S.note }, t('card.env.hint')),
-        ...ENV_CONTRACT.map(env =>
-          h(
-            'div',
-            { style: S.section },
-            h('span', { style: S.value }, h('span', { style: S.mono }, env.name), ` — ${t(env.descriptionKey)}`),
-            h('span', { style: S.mono }, env.expected),
+      foldGroup(t, [
+        fold(t('card.models'), [row(t('card.models.catalog'), modelLine)]),
+        fold(t('card.defaults'), [
+          row(t('card.defaults.model'), DEFAULT_MODEL, true),
+          row(t('card.defaults.sessionMode'), t('card.defaults.sessionMode.value')),
+          row(t('card.defaults.toolPolicy'), t('card.defaults.toolPolicy.value')),
+          row(t('card.defaults.mode'), t('card.defaults.mode.value')),
+          row(t('card.defaults.imageInput'), t('card.defaults.imageInput.value')),
+          h('span', { style: S.note }, t('card.defaults.source')),
+        ]),
+        h('div', { style: S.divider }),
+        fold(t('card.cli'), [
+          row(t('card.cli.node'), NODE_PATH, true),
+          row(t('card.cli.cjs'), ZCODE_CJS_PATH, true),
+        ]),
+        fold(t('card.env'), [
+          h('span', { style: S.note }, t('card.env.hint')),
+          ...ENV_CONTRACT.map(env =>
+            h(
+              'div',
+              { style: S.section },
+              h('span', { style: S.value }, h('span', { style: S.mono }, env.name), ` — ${t(env.descriptionKey)}`),
+              h('span', { style: S.mono }, env.expected),
+            ),
           ),
-        ),
+        ]),
       ]),
     )
   }

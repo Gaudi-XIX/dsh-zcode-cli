@@ -1,11 +1,9 @@
 /**
- * Card stylesheet, taken verbatim from the Antigravity provider's client
- * (F:\\defws\\dsh-agy-provider\\client\\index.ts) with the `agy-` prefix renamed
- * to `zc-`. The user asked for this card to look exactly like that one, so the
- * look is a copy, not a design of ours: keep them in step when agy changes.
+ * Card stylesheet. Every class carries the `zc-` prefix so nothing can leak
+ * into the host's own settings UI, and every colour resolves through the
+ * `--zc-*` variables below so the card tracks light and dark themes.
  *
- * Injected by the card as a single <style> node; every class is prefixed so it
- * cannot leak into the host's own settings UI.
+ * Injected by the card as a single <style> node.
  */
 export const ZC_CSS = `
 @keyframes zc-spin {
@@ -341,6 +339,41 @@ body.dark,
 .zc-check-item input {
 	cursor: pointer;
 	margin: 0;
+}
+.zc-fold-group {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+.zc-fold-bar {
+	display: flex;
+	justify-content: flex-end;
+}
+.zc-fold-switch {
+	font: inherit;
+	font-size: 11.5px;
+	line-height: 1.4;
+	padding: 2px 8px;
+	border-radius: 5px;
+	cursor: pointer;
+	color: var(--zc-text-secondary);
+	background: var(--zc-bg-btn);
+	border: 1px solid var(--zc-border-btn);
+}
+.zc-fold-switch:hover {
+	background: var(--zc-bg-btn-hover);
+}
+/* The label follows the group, not a click counter: once every block is open
+   the switch offers "collapse all", otherwise "expand all". A block opened by
+   hand can therefore never leave a lying label behind. */
+.zc-fold-switch > .zc-fold-collapse {
+	display: none;
+}
+.zc-fold-group:not(:has(> details.zc-fold:not([open]))) > .zc-fold-bar .zc-fold-expand {
+	display: none;
+}
+.zc-fold-group:not(:has(> details.zc-fold:not([open]))) > .zc-fold-bar .zc-fold-collapse {
+	display: inline;
 }
 .zc-fold {
 	border: 1px solid var(--zc-border-box);

@@ -45,8 +45,8 @@
  *
  * Sampling fields (`temperature`/`maxTokens`/`stop`) apply to the `-p` route
  * only: the app-server protocol has no such fields, and DSH web sends defaults
- * on every turn, so the free-plan route drops them silently (agy.ts made the
- * same call) instead of refusing the request.
+ * on every turn, so the free-plan route drops them silently instead of
+ * refusing the request.
  *
  * | policy | request carries `tools` | `temperature`/`maxTokens`/`stop` (-p route) | image/file block | a tool-shaped stdout frame |
  * | --- | --- | --- | --- | --- |
@@ -556,10 +556,10 @@ export class ZcodeAdapter extends LlmAdapter {
         return
       }
     }
-    // DSH web sends default temperature/maxTokens on every turn (agy.ts hit the
-    // same wall and resolved it by continuing with CLI defaults instead of
-    // refusing). The app-server protocol has no such fields, so they are
-    // dropped here and the CLI's own defaults apply.
+    // DSH web sends default temperature/maxTokens on every turn. The app-server
+    // protocol has no such fields, so they are dropped here and the CLI's own
+    // defaults apply: refusing would fail every turn over a field this route
+    // cannot carry anyway.
 
     // Session lookup happens before the prompt is built, mirroring the `-p`
     // route: a resumed ZCode session already holds everything up to its last
