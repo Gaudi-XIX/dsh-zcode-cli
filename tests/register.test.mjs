@@ -83,7 +83,7 @@ test('apply registers exactly one adapter on the zcode route with the frozen set
   // identity fields are the host contract, not cosmetics.
   assert.deepEqual(calls.providers, [{
     provider: 'zcode',
-    displayName: 'ZCode',
+    displayName: 'ZCode CLI',
     settingsNs: 'dsh-zcode-provider',
     settingsPath: [],
   }])
@@ -98,7 +98,7 @@ test('apply registers exactly one adapter on the zcode route with the frozen set
   assert.equal(plugin.name, 'dsh-zcode-provider')
   assert.equal(plugin.ZCODE_PROVIDER_ROUTE, 'zcode')
   assert.equal(plugin.ZCODE_SETTINGS_NS, 'dsh-zcode-provider')
-  assert.equal(plugin.ZCODE_DISPLAY_NAME, 'ZCode')
+  assert.equal(plugin.ZCODE_DISPLAY_NAME, 'ZCode CLI')
   assert.equal(plugin.name, calls.providers[0].settingsNs)
 })
 
@@ -121,7 +121,7 @@ test('the registered adapter is a constructible LlmAdapter with a stream method'
   assert.equal(typeof adapter.stream, 'function')
   assert.equal(typeof rebuilt.stream, 'function')
   for (const instance of [adapter, rebuilt]) {
-    assert.deepEqual(instance.providerInfo('zcode'), { id: 'zcode', name: 'ZCode' })
+    assert.deepEqual(instance.providerInfo('zcode'), { id: 'zcode', name: 'ZCode CLI' })
     assert.ok(instance instanceof ZcodeAdapter)
   }
 })

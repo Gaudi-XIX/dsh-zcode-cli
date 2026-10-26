@@ -154,7 +154,7 @@ export const ZCODE_PROVIDER_ROUTE = 'zcode'
 export const ZCODE_SETTINGS_NS = 'dsh-zcode-provider'
 
 /** Display name of the provider card on the Models page. */
-export const ZCODE_DISPLAY_NAME = 'ZCode'
+export const ZCODE_DISPLAY_NAME = 'ZCode CLI'
 
 /**
  * Module specifier of the adapter implementation, resolved at apply time.

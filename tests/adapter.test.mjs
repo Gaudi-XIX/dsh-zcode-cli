@@ -259,7 +259,7 @@ function argvLog() {
 
 test('the provider surface advertises the configured route and policy', () => {
   const instance = new ZcodeAdapter({ model: 'GLM-5.3-Flash' }, { logger: () => {} })
-  assert.deepEqual(instance.providerInfo('zcode'), { id: 'zcode', name: 'ZCode' })
+  assert.deepEqual(instance.providerInfo('zcode'), { id: 'zcode', name: 'ZCode CLI' })
 
   const policy = instance.providerRetryPolicy('zcode')
   assert.equal(policy.maxRetries, 2)

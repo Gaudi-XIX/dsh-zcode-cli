@@ -158,7 +158,7 @@ import { readZcodePlanToken } from '../zcode/credential.js'
 import { ZCODE_EFFORT_IDS, ZCODE_MODEL_IDS } from '../selection.js'
 
 /** Display name of the provider card; the route id is `providerInfo().id`. */
-export const ZCODE_PROVIDER_DISPLAY_NAME = 'ZCode'
+export const ZCODE_PROVIDER_DISPLAY_NAME = 'ZCode CLI'
 
 /**
  * Diagnostic path handed to `resolveRetryPolicy()`.

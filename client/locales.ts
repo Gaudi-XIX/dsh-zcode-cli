@@ -14,7 +14,7 @@
 export const NS = 'dsh-zcode-provider'
 
 export const zh = {
-  'card.title': 'ZCode',
+  'card.title': 'ZCode CLI',
   'card.badge.on': '已在目录中',
   'card.badge.off': '未在目录中',
   'card.badge.unknown': '状态未知',
@@ -60,7 +60,7 @@ export type ZcodeLocaleKey = keyof typeof zh
 export type ZcodeDictionary = Record<ZcodeLocaleKey, string>
 
 export const en: ZcodeDictionary = {
-  'card.title': 'ZCode',
+  'card.title': 'ZCode CLI',
   'card.badge.on': 'In the directory',
   'card.badge.off': 'Not in the directory',
   'card.badge.unknown': 'State unknown',
