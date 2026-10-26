@@ -22,14 +22,14 @@ import { DEFAULT_MODELS } from '../provider/config.js'
 import { sanitizeSecrets } from '../provider/error-codes.js'
 
 /** Exact path of the selection route (GET + POST). */
-export const ZCODE_STATE_ROUTE_PATH = '/plugins/dsh-zcode-provider/state'
+export const ZCODE_STATE_ROUTE_PATH = '/plugins/dsh-zcode-cli/state'
 /**
  * Host-side diagnostic route. Loopback-only, read-only, and mounted only when
  * the caller injects a probe: it exists to answer questions only the host
  * process can answer (why the model picker hides this provider, whether the
  * browser half reached `window.__DSH_BOOT__`).
  */
-export const ZCODE_DIAG_ROUTE_PATH = '/plugins/dsh-zcode-provider/diag'
+export const ZCODE_DIAG_ROUTE_PATH = '/plugins/dsh-zcode-cli/diag'
 
 /** Effort ids the host accepts on this route. Frozen with the card. */
 export const ZCODE_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const

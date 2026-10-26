@@ -8,7 +8,7 @@ import test from 'node:test'
 import { buildZcodeArgs } from '../lib/zcode/process.js'
 
 const PROMPT = 'Summarise the file I just opened.'
-const CWD = 'F:\\defws\\dsh-zcode-provider'
+const CWD = 'F:\\defws\\dsh-zcode-cli'
 
 /** Position of `--mode` in an argv, or -1. */
 function modeIndex(argv) {

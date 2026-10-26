@@ -248,7 +248,7 @@ export function createConfigSchema(defaults: {
     },
   })
   return localized
-    .comment('其余字段在 cordis.patch.yml 中，请直接编辑对应段。 (dsh-zcode-provider)') as unknown as z<Config>
+    .comment('其余字段在 cordis.patch.yml 中，请直接编辑对应段。 (dsh-zcode-cli)') as unknown as z<Config>
 }
 
 /** Programmatic library default: enabled=false, toolPolicy=reject. */

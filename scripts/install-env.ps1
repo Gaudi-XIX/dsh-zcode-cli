@@ -3,7 +3,7 @@
     Write the environment variables ZCode 0.17.0 needs, at user scope.
 
 .DESCRIPTION
-    dsh-zcode-provider is fail-closed: it refuses to spawn the CLI unless the
+    dsh-zcode-cli is fail-closed: it refuses to spawn the CLI unless the
     four ZCODE_* variables are set, and it never derives them on its own (a
     guessed path is how the CLI dies 714 ms in with a message far from the
     cause). NODE_OPTIONS is not required any more: the provider injects it into
@@ -121,9 +121,9 @@ $entries = @(
 
 Write-Host $separator
 if ($Apply) {
-    Write-Host 'dsh-zcode-provider: writing ZCode environment contract (scope: User)'
+    Write-Host 'dsh-zcode-cli: writing ZCode environment contract (scope: User)'
 } else {
-    Write-Host 'dsh-zcode-provider: DRY RUN (nothing is written; pass -Apply to write)'
+    Write-Host 'dsh-zcode-cli: DRY RUN (nothing is written; pass -Apply to write)'
 }
 Write-Host $separator
 

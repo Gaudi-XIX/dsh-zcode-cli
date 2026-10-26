@@ -3,7 +3,7 @@
  * provider row on 设置 → 模型.
  *
  * Why it exists: the Node half registers the directory entry
- * (`ctx.llm.registerConfigurableProviders`, `settingsNs: 'dsh-zcode-provider'`
+ * (`ctx.llm.registerConfigurableProviders`, `settingsNs: 'dsh-zcode-cli'`
  * in `src/index.ts`), and the host then renders that row's body by dispatching
  * the keyed slot `settings.models.provider-card` for the entry whose registered
  * `key` equals the row's `settingsNs` **verbatim**. With no client half there is
@@ -12,7 +12,7 @@
  *
  * Scope: a run-configuration block (plan, model, reasoning effort) plus a
  * read-only information panel. The run-configuration block reads and writes the
- * plugin's own loopback route (`GET`/`POST /plugins/dsh-zcode-provider/state`,
+ * plugin's own loopback route (`GET`/`POST /plugins/dsh-zcode-cli/state`,
  * mounted by `src/web/router.ts`). Everything below the divider is a
  * compile-time mirror of the Node half or a value read out of the
  * slot props the host does pass — `{ provider, configured, keyConfigured }`
@@ -65,7 +65,7 @@ export interface ClientContext extends Context {
   locale: LocaleLike
 }
 
-export const name = 'dsh-zcode-provider-client'
+export const name = 'dsh-zcode-cli-client'
 
 /**
  * Cordis `inject` entries are hard dependencies: touching a service that is not
@@ -82,7 +82,7 @@ export const inject = ['slots', 'locale']
 // mirrors, so drift fails the gate instead of quietly lying on the settings page.
 
 /** MUST equal `ZCODE_SETTINGS_NS` in `src/index.ts`; this is the slot key. */
-const SETTINGS_NS = 'dsh-zcode-provider'
+const SETTINGS_NS = 'dsh-zcode-cli'
 /** MUST equal `ZCODE_PROVIDER_ROUTE` in `src/index.ts`. */
 const PROVIDER_ROUTE = 'zcode'
 /** Slot registration id; unique per card, not a contract with the host. */
@@ -95,7 +95,7 @@ const MODELS: readonly string[] = ['GLM-5.3-Flash', 'GLM-5.3']
 const NODE_PATH = 'D:\\nodejs\\node.exe'
 const ZCODE_CJS_PATH = 'F:\\AgentData\\zcode\\cli\\resources\\glm\\zcode.cjs'
 /** MUST equal `ZCODE_STATE_ROUTE_PATH` in `src/web/router.ts`. */
-const STATE_PATH = '/plugins/dsh-zcode-provider/state'
+const STATE_PATH = '/plugins/dsh-zcode-cli/state'
 
 /** One row of the environment contract shown on the card. */
 interface EnvRow {
@@ -446,7 +446,7 @@ export function apply(ctx: ClientContext): void {
       disposeEn()
       disposeZh()
     }
-  }, 'dsh-zcode-provider: locale dictionaries')
+  }, 'dsh-zcode-cli: locale dictionaries')
 
   const useTranslation = (): ((key: ZcodeLocaleKey) => string) => {
     const [, rerender] = useState(0)

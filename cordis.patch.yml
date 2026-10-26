@@ -1,6 +1,6 @@
 # Bundle entry is enabled by default when installed through dsh plugin add.
 # Install this package into a DSH profile with:
-# npx @deepseek-ai/dsh plugin --profile desktop add dsh-zcode-provider
+# npx @deepseek-ai/dsh plugin --profile desktop add dsh-zcode-cli
 #
 # Every key below matches the Config schema in src/provider/config.ts. The
 # ZCode environment contract (ZCODE_HOME / ZCODE_DATA_BASE_DIR /
@@ -9,8 +9,8 @@
 # assertEnvContract() in src/zcode/process.ts, and must be supplied by whoever
 # launches the DSH host. See the handoff for the per-entry expected values.
 - insert:
-    - id: dsh-zcode-provider
-      name: dsh-zcode-provider
+    - id: dsh-zcode-cli
+      name: dsh-zcode-cli
       config:
         enabled: true
         provider: zcode

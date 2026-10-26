@@ -1,5 +1,5 @@
 {
-  "name": "dsh-zcode-provider",
+  "name": "dsh-zcode-cli",
   "version": "0.2.0",
   "private": false,
   "publishConfig": {
@@ -72,10 +72,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Gaudi-XIX/dsh-zcode-provider.git"
+    "url": "git+https://github.com/Gaudi-XIX/dsh-zcode-cli.git"
   },
   "bugs": {
-    "url": "https://github.com/Gaudi-XIX/dsh-zcode-provider/issues"
+    "url": "https://github.com/Gaudi-XIX/dsh-zcode-cli/issues"
   },
-  "homepage": "https://github.com/Gaudi-XIX/dsh-zcode-provider#readme"
+  "homepage": "https://github.com/Gaudi-XIX/dsh-zcode-cli#readme"
 }

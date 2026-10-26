@@ -133,7 +133,7 @@ async function catalogProbe(ctx: ProbeContext, webServer: ZcodeWebServerLike | u
 }
 
 /** Plugin identity; also the settings namespace the Models page keys on. */
-export const name = 'dsh-zcode-provider'
+export const name = 'dsh-zcode-cli'
 
 /**
  * Services this plugin needs before `apply` runs.
@@ -151,7 +151,7 @@ export const Config = BundleConfig
 export const ZCODE_PROVIDER_ROUTE = 'zcode'
 
 /** Settings namespace; MUST equal the package name, which is what the UI matches. */
-export const ZCODE_SETTINGS_NS = 'dsh-zcode-provider'
+export const ZCODE_SETTINGS_NS = 'dsh-zcode-cli'
 
 /** Display name of the provider card on the Models page. */
 export const ZCODE_DISPLAY_NAME = 'ZCode CLI'

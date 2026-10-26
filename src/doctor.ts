@@ -103,7 +103,7 @@ export interface DoctorPaths {
 /** Machine-readable doctor report. Contains no plan-state verdict by design. */
 export interface DoctorReport {
   readonly schemaVersion: 2
-  readonly plugin: 'dsh-zcode-provider'
+  readonly plugin: 'dsh-zcode-cli'
   readonly checkedAt: string
   /** No `fail` check. Warnings leave this `true`: they are drift, not breakage. */
   readonly ok: boolean
@@ -293,7 +293,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
 
   return {
     schemaVersion: 2,
-    plugin: 'dsh-zcode-provider',
+    plugin: 'dsh-zcode-cli',
     checkedAt: now().toISOString(),
     ok: status !== 'fail',
     status,

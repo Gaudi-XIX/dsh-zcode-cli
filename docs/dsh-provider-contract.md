@@ -1,6 +1,6 @@
 # DSH Provider 契约（ZCode 副本）
 
-本文件是 `dsh-zcode-provider` 对 DSH 宿主契约的现场记录：宿主需要什么、本插件承诺什么、哪些是实测过的、哪些仍是待续订后补测的已知限制。内容按本仓代码逐条对账，不引用其他 provider 仓的文档（避免外部漂移）。
+本文件是 `dsh-zcode-cli` 对 DSH 宿主契约的现场记录：宿主需要什么、本插件承诺什么、哪些是实测过的、哪些仍是待续订后补测的已知限制。内容按本仓代码逐条对账，不引用其他 provider 仓的文档（避免外部漂移）。
 
 ## 验证基线
 
@@ -14,11 +14,11 @@
 插件是 Cordis 模块，导出（`src/index.ts`）：
 
 ```ts
-export const name = 'dsh-zcode-provider'
+export const name = 'dsh-zcode-cli'
 export const inject = ['llm', 'sessions', 'workspaceRegistry', 'sandboxPolicy', 'permissionPresets', 'approval']
 export const Config = BundleConfig            // bundle 默认 enabled: true
 export const ZCODE_PROVIDER_ROUTE = 'zcode'
-export const ZCODE_SETTINGS_NS = 'dsh-zcode-provider'
+export const ZCODE_SETTINGS_NS = 'dsh-zcode-cli'
 export const ZCODE_DISPLAY_NAME = 'ZCode'
 export async function apply(ctx: Context, config: Config): Promise<void>
 ```
@@ -29,7 +29,7 @@ export async function apply(ctx: Context, config: Config): Promise<void>
 ctx.llm.registerConfigurableProviders([{
   provider: 'zcode',
   displayName: 'ZCode',
-  settingsNs: 'dsh-zcode-provider',
+  settingsNs: 'dsh-zcode-cli',
   settingsPath: [],
 }])
 ```
@@ -241,9 +241,9 @@ ZCode 0.17.0 需要四项**宿主提供**的路径变量，外加一项 **provid
 宿主给「设置 → 模型」里每个 provider 行渲染槽 `settings.models.provider-card`，槽位**没有回退表单**：找不到与 `entryKey` 匹配的卡片时行体就是空的。所以本包必须带一个浏览器半边，否则后端再正常，设置页里 ZCode 那一行也是空白。
 
 - 入口：`client/index.ts`（源码）→ `scripts/build-client.mjs`（TypeScript 编译器 API 打包）→ `dist/client.js`（单文件 ESM，`dist/` 被 gitignore，门禁构建它）。`package.json` 声明 `dsh.client = { inject: ['@deepseek-ai/dsh-client-ui-primitives'], platform: 'web' }` 与 `exports['./client']`。
-- 槽键：`ctx.slots.register({ name: 'settings.models.provider-card', key: 'dsh-zcode-provider', id: 'zcode-provider-card' }, …)`。`key` 必须**逐字等于** Node 半边的 `ZCODE_SETTINGS_NS`（`src/index.ts`），宿主按这个字符串匹配，写错一个字符就回到空白行。
+- 槽键：`ctx.slots.register({ name: 'settings.models.provider-card', key: 'dsh-zcode-cli', id: 'zcode-provider-card' }, …)`。`key` 必须**逐字等于** Node 半边的 `ZCODE_SETTINGS_NS`（`src/index.ts`），宿主按这个字符串匹配，写错一个字符就回到空白行。
 - 槽位 props 只有 `{ provider, configured, keyConfigured }`，**不含配置本体**（配置在同一个槽的兄弟表单里）。卡片上半部分是**运行配置块**（套餐 / 模型 / 推理强度三个 `<select>`，读写插件自己的 loopback state 路由），下半部分是**只读信息面板**：路由 / 命名空间 / 模型目录 / 随包默认值（`sessionMode` / `toolPolicy` / `mode` / `imageInput`）/ CLI 入口（`node` 与 `zcode.cjs` 绝对路径）/ 环境契约五变量。除该 state 路由外，卡片不读写宿主配置，也不碰任何 ZCode 文件。
-- state 路由契约：`GET`/`POST /plugins/dsh-zcode-provider/state`（`ZCODE_STATE_ROUTE_PATH`，`src/web/router.ts`；客户端字面量 `STATE_PATH`，`tests/client.test.mjs` 钉住两者相等）。成功信封 `{ ok: true, state: { plan, model, effort, plans[], models[], efforts[] }, error: null }`；失败 `{ ok: false, error: { code, message } }`；无法识别的值回 `400` + `error.code = 'INVALID_SELECTION'`。客户端 `readSelectionEnvelope()` 只接受 `ok === true` 且 `state` 齐备，否则渲染成一行失败提示而不是静默空白。
+- state 路由契约：`GET`/`POST /plugins/dsh-zcode-cli/state`（`ZCODE_STATE_ROUTE_PATH`，`src/web/router.ts`；客户端字面量 `STATE_PATH`，`tests/client.test.mjs` 钉住两者相等）。成功信封 `{ ok: true, state: { plan, model, effort, plans[], models[], efforts[] }, error: null }`；失败 `{ ok: false, error: { code, message } }`；无法识别的值回 `400` + `error.code = 'INVALID_SELECTION'`。客户端 `readSelectionEnvelope()` 只接受 `ok === true` 且 `state` 齐备，否则渲染成一行失败提示而不是静默空白。
 - 选项语义：`plans` 两个（`free` 免费套餐 / `paid` 付费套餐）。`plan` **决定传输路线**（`free`＝app-server 注入通道，其余＝一次性 `-p`）；在 `-p` 路线内部它不改变 argv。`model` 与 `effort` 在 `-p` 路线不改变 argv——0.17.0 的 CLI 没有 `--model` / `--effort` 旗标（免费路线里两者经 `session/send` 的 `modelSelection` 真实下发）。selection 的作用是**让卡片的选择与守卫一致**：请求模型与选择模型或配置默认模型都不相等时才 `MODEL_NOT_FOUND` 且不 spawn。
 - 样式：`client/styles.ts` 导出 `ZC_CSS`，由卡片在渲染树里 `h('style', null, ZC_CSS)` 注入；下拉样式照抄 `F:\defws\dsh-agy-provider\client\index.ts` 的 `.agy-select`（改名 `zc-select`，连同 `:root` 亮/暗色变量与 `.zc-btn`），这是用户明确要求「参考我已经做好的，不要自己造轮子」的落点。
 - Hook 纪律：`useState` / `useEffect` 只在组件上方的 `useTranslation()` 与 `useSelection()` 里，组件函数体**只有两句 hook（都在首行区）、只有一个 return**。宿主用 `SlotErrorBoundary` 包住槽内容，渲染期抛异常会渲染成空元素——hook 在条件 return 之后导致 hook 数变化时，症状与本卡片要修的空白行一模一样。`tests/client.test.mjs` 把这条结构钉住。

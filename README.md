@@ -1,4 +1,4 @@
-# dsh-zcode-provider
+# dsh-zcode-cli
 
 DSH 的 **safe provider**：把本机 ZCode CLI（`zcode.cjs`，ZCode 0.17.0）作为一个 `zcode` 路由接进 DSH 的 LLM 层。一个 `LlmAdapter`，无运行时依赖（`dependencies` 为空），Node ≥ 22。
 
@@ -48,7 +48,7 @@ DSH 市场里已有两条同走官方 CLI 委托路线的 ZCode 插件，都是�
 - 把 ZCode 的输出帧按 DSH 的 `StreamChunk` 顺序投影（`block-start → delta* → block-end → usage → finish`），空输出与不可识别输出永不静默成功。
 - 在**启动子进程之前**拒绝它兑现不了的请求：`tools`、`temperature`/`maxTokens`/非空 `stop`、`reject` 政策下的 image/file block，各配稳定错误码。
 - 子进程环境是**闭集**：OS 基础变量白名单 + 五项契约值 + `passEnv`，宿主其他变量不外泄；`NODE_OPTIONS` 强制并入 ipv4-first DNS 修复，未知 flag 丢弃不透传。
-- 设置页卡片读写插件自己的 loopback 路由 `GET`/`POST /plugins/dsh-zcode-provider/state`；「套餐」下拉自 2026-10-25 起是传输选择（免费＝app-server，付费＝`-p`），两者都是官方 CLI 子进程。
+- 设置页卡片读写插件自己的 loopback 路由 `GET`/`POST /plugins/dsh-zcode-cli/state`；「套餐」下拉自 2026-10-25 起是传输选择（免费＝app-server，付费＝`-p`），两者都是官方 CLI 子进程。
 
 不做什么：不做模型发现（ZCode 没有免配额的模型列表）、不猜计费（150% 倍率无服务端读数前不宣称）、不伪造 sessionId、不写 ZCode 的 `setting.json` / `provider_config.json`。
 

@@ -11,7 +11,7 @@
  * `tsc -p tsconfig.client.json` fails.
  */
 
-export const NS = 'dsh-zcode-provider'
+export const NS = 'dsh-zcode-cli'
 
 export const zh = {
   'card.title': 'ZCode CLI',

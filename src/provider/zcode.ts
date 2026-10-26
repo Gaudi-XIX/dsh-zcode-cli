@@ -166,7 +166,7 @@ export const ZCODE_PROVIDER_DISPLAY_NAME = 'ZCode CLI'
  * It names the configuration section that owns the value, so an invalid policy
  * is reported against something the user can actually edit.
  */
-export const ZCODE_CONFIG_PATH = 'dsh-zcode-provider'
+export const ZCODE_CONFIG_PATH = 'dsh-zcode-cli'
 
 /**
  * Ceiling on the rendered prompt, in characters.

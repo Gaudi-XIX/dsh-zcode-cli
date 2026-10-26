@@ -84,7 +84,7 @@ test('apply registers exactly one adapter on the zcode route with the frozen set
   assert.deepEqual(calls.providers, [{
     provider: 'zcode',
     displayName: 'ZCode CLI',
-    settingsNs: 'dsh-zcode-provider',
+    settingsNs: 'dsh-zcode-cli',
     settingsPath: [],
   }])
   // One mount, one adapter: a second registration would fight the first over
@@ -95,9 +95,9 @@ test('apply registers exactly one adapter on the zcode route with the frozen set
 
   // The exported identity is the same one the payload carries; the settings
   // namespace must equal the package name, because the host matches on it.
-  assert.equal(plugin.name, 'dsh-zcode-provider')
+  assert.equal(plugin.name, 'dsh-zcode-cli')
   assert.equal(plugin.ZCODE_PROVIDER_ROUTE, 'zcode')
-  assert.equal(plugin.ZCODE_SETTINGS_NS, 'dsh-zcode-provider')
+  assert.equal(plugin.ZCODE_SETTINGS_NS, 'dsh-zcode-cli')
   assert.equal(plugin.ZCODE_DISPLAY_NAME, 'ZCode CLI')
   assert.equal(plugin.name, calls.providers[0].settingsNs)
 })
