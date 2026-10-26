@@ -363,6 +363,20 @@ function section(title: string, children: readonly unknown[]): unknown {
 }
 
 /**
+ * A titled block the user can fold away. Native `<details>`/`<summary>`:
+ * zero React state (the card's hooks-order contract stays untouched) and the
+ * open/closed state lives in the DOM, so it survives host re-renders.
+ */
+function fold(title: string, children: readonly unknown[], open = false): unknown {
+  return h(
+    'details',
+    { className: 'zc-fold', open },
+    h('summary', null, title),
+    h('div', { className: 'zc-fold-body' }, ...children),
+  )
+}
+
+/**
  * The run-configuration block: plan, model and reasoning effort, each a
  * select that writes straight back to the state route.
  *
@@ -541,8 +555,8 @@ export function apply(ctx: ClientContext): void {
       row(t('card.route'), provider, true),
       row(t('card.ns'), SETTINGS_NS, true),
       h('div', { style: S.divider }),
-      section(t('card.models'), [row(t('card.models.catalog'), modelLine)]),
-      section(t('card.defaults'), [
+      fold(t('card.models'), [row(t('card.models.catalog'), modelLine)]),
+      fold(t('card.defaults'), [
         row(t('card.defaults.model'), DEFAULT_MODEL, true),
         row(t('card.defaults.sessionMode'), t('card.defaults.sessionMode.value')),
         row(t('card.defaults.toolPolicy'), t('card.defaults.toolPolicy.value')),
@@ -551,11 +565,11 @@ export function apply(ctx: ClientContext): void {
         h('span', { style: S.note }, t('card.defaults.source')),
       ]),
       h('div', { style: S.divider }),
-      section(t('card.cli'), [
+      fold(t('card.cli'), [
         row(t('card.cli.node'), NODE_PATH, true),
         row(t('card.cli.cjs'), ZCODE_CJS_PATH, true),
       ]),
-      section(t('card.env'), [
+      fold(t('card.env'), [
         h('span', { style: S.note }, t('card.env.hint')),
         ...ENV_CONTRACT.map(env =>
           h(
@@ -566,7 +580,6 @@ export function apply(ctx: ClientContext): void {
           ),
         ),
       ]),
-      h('div', { style: S.divider }),
     )
   }
 

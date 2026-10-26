@@ -342,4 +342,43 @@ body.dark,
 	cursor: pointer;
 	margin: 0;
 }
+.zc-fold {
+	border: 1px solid var(--zc-border-box);
+	border-radius: 6px;
+	background: var(--zc-bg-subbox);
+}
+.zc-fold > summary {
+	cursor: pointer;
+	list-style: none;
+	user-select: none;
+	font-weight: 600;
+	font-size: 12px;
+	opacity: 0.85;
+	padding: 5px 9px;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.zc-fold > summary::-webkit-details-marker {
+	display: none;
+}
+.zc-fold > summary::before {
+	content: '▸';
+	display: inline-block;
+	font-size: 10px;
+	transition: transform 0.15s ease;
+}
+.zc-fold[open] > summary::before {
+	transform: rotate(90deg);
+}
+.zc-fold > summary:hover {
+	opacity: 1;
+}
+.zc-fold-body {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	padding: 2px 9px 7px;
+}
 `
+
