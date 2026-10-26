@@ -13,9 +13,36 @@ import { existsSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 
-import { BundleConfig, configBoolean, type Config as ConfigType } from './provider/config.js'
+import { BundleConfig, configBoolean, configFlag, type Config as ConfigType } from './provider/config.js'
 import { createZcodeWebRoutes, type ZcodeWebServerLike } from './web/router.js'
 import { SelectionStore } from './selection.js'
+
+/**
+ * Version reported to ZCode in the MCP `serverInfo` handshake.
+ *
+ * Kept beside the code instead of read from `package.json`: the entry point is
+ * loaded during host boot and a filesystem read there is one more way for the
+ * provider to fail. Bumped with `package.json` — a functional merge bumps the
+ * minor, a fix keeps the number.
+ */
+const ZCODE_SERVER_VERSION = '0.3.0'
+
+/** The slice of `src/mcp/bridge.ts` the bundle entry keeps a handle to. */
+interface ZcodeToolBridgeLike {
+  readonly active: boolean
+  readonly inactiveReason: string | undefined
+  readonly url: string | undefined
+  /** `session/create.mcpServers` entries; empty when the bridge is not live. */
+  readonly mcpServers: () => readonly {
+    readonly name: string
+    readonly type: 'http'
+    readonly url: string
+    readonly headers: ReadonlyArray<{ readonly name: string; readonly value: string }>
+  }[]
+  /** Point the endpoint at the DSH session owning the next turn. */
+  readonly setSession: (sessionId: string) => void
+  readonly dispose: () => Promise<void>
+}
 
 /** Disposers for the routes this bundle mounted; drained on dispose. */
 const webServerDisposers: Array<() => void> = []
@@ -179,6 +206,17 @@ export interface ZcodeAdapterDeps {
    * import of its types would make the two modules fail together.
    */
   readonly getSelection?: (() => { readonly plan?: string; readonly model?: string; readonly effort?: string } | undefined) | undefined
+  /** Resolve the live MCP tool bridge; structural for the same reason as above. */
+  readonly resolveMcpBridge?: (() => {
+    readonly active: boolean
+    readonly mcpServers: () => readonly {
+      readonly name: string
+      readonly type: 'http'
+      readonly url: string
+      readonly headers: ReadonlyArray<{ readonly name: string; readonly value: string }>
+    }[]
+    readonly setSession: (sessionId: string) => void
+  } | undefined) | undefined
 }
 
 /** The slice of a DSH session record this entry reads. */
@@ -287,6 +325,47 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
     logger.warn('zcode: selection not primed: %s', describe(error))
   }
 
+  // The MCP tool bridge hands the host's own tools to ZCode out of band (their
+  // schemas never enter the prompt) and routes every execution back through the
+  // host's tool pipeline. It is started from the webServer readiness callback
+  // because the carrier has to exist first, and it is kept behind a dynamic
+  // import so a bridge that fails to load can never stop the provider from
+  // registering.
+  let toolBridge: ZcodeToolBridgeLike | undefined
+  let toolBridgeStarting = false
+  const wantsBridge = configFlag(config.mcpBridge, true)
+    && ((config.toolPolicy as unknown as string | undefined) ?? 'dsh-owned') === 'dsh-owned'
+  const startToolBridge = (webServer: ZcodeWebServerLike): void => {
+    if (!wantsBridge || toolBridgeStarting) return
+    toolBridgeStarting = true
+    void (async () => {
+      try {
+        const bridgeModule = await import('./mcp/bridge.js') as unknown as {
+          startDshMcpBridge: (options: Record<string, unknown>) => Promise<ZcodeToolBridgeLike>
+        }
+        const bridge = await bridgeModule.startDshMcpBridge({
+          webServer,
+          // Read through `ctx.get` instead of property access: the tool service
+          // is mounted by another bundle and Cordis wants declared injections
+          // for property reads. A miss here is reported by the bridge itself.
+          tools: ctx.get('tools'),
+          sessionControllerLookup: () => ctx.get('sessionController'),
+          serverVersion: ZCODE_SERVER_VERSION,
+          logger: (message: string) => logger.info(message),
+        })
+        toolBridge = bridge
+        if (!bridge.active) {
+          logger.warn('zcode: MCP tool bridge inactive: %s', bridge.inactiveReason ?? 'unknown reason')
+        } else {
+          logger.info('zcode: MCP tool bridge live at %s', bridge.url ?? '<pending port>')
+        }
+      } catch (error) {
+        // Never throw: the provider must keep working with the CLI's built-ins.
+        logger.warn('zcode: MCP tool bridge failed to start: %s', describe(error))
+      }
+    })()
+  }
+
   try {
     const routes = createZcodeWebRoutes({
       getConfig: () => selectionStore.get(),
@@ -297,6 +376,7 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
       const webServer = (innerCtx as unknown as { webServer?: ZcodeWebServerLike }).webServer
       if (webServer === undefined || typeof webServer.register !== 'function') return
       mountedWebServer = webServer
+      startToolBridge(webServer)
       try {
         webServerDisposers.push(routes.register(webServer))
       } catch (error) {
@@ -365,7 +445,14 @@ export async function apply(ctx: Context, config: ConfigType): Promise<void> {
         return undefined
       }
     },
+    // Resolved per turn: the bridge starts asynchronously after this point, so
+    // a captured value would stay undefined for the life of the host.
+    resolveMcpBridge: () => {
+      if (!wantsBridge) return undefined
+      return toolBridge?.active === true ? toolBridge : undefined
+    },
   })
+
 
   ctx.llm.registerAdapter([ZCODE_PROVIDER_ROUTE], adapter)
   logger.info('zcode: adapter registered on route %s', ZCODE_PROVIDER_ROUTE)

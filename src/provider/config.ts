@@ -57,6 +57,24 @@ export interface Config {
   modelDiscovery?: 'off'
   /** Ownership policy for DSH tool schemas; ZCode stays the internal tool owner. */
   toolPolicy?: ZcodeToolPolicy
+  /**
+   * Project the DSH tool registry to ZCode over MCP.
+   *
+   * Takes effect only when `toolPolicy` is `dsh-owned`: that is the policy that
+   * promises the host executes the tools, and the bridge is what makes the
+   * promise true. Off keeps the CLI's built-in tools only.
+   */
+  mcpBridge?: boolean
+  /**
+   * Tool names handed to the CLI's `session/create.toolAllowlist`.
+   *
+   * Pass-through only: the key exists in the CLI's strict schema, but what it
+   * filters (and whether names are bare or `mcp__server__tool`) was never
+   * measured here. Empty means "do not send the key at all".
+   */
+  toolAllowlist?: string[]
+  /** Tool names handed to `session/create.toolDenylist`; same caveat as above. */
+  toolDenylist?: string[]
   /** CLI permission mode; fixed to `guarded`. */
   mode?: ZcodeMode
   /** `resume` reuses a ZCode session id, `full` replays the whole history. */
@@ -173,6 +191,9 @@ export function createConfigSchema(defaults: {
     // One-member union on purpose: no verified discovery command exists.
     modelDiscovery: z.union(['off'] as const).default('off').description('Model discovery; off keeps the static catalog'),
     toolPolicy: z.union(['reject', 'zcode-owned', 'dsh-owned'] as const).default(defaultToolPolicy).description('Tool ownership policy'),
+    mcpBridge: z.boolean().default(true).description('Project the DSH tool registry to ZCode over MCP; only honoured when toolPolicy is dsh-owned'),
+    toolAllowlist: z.array(z.string().pattern(/^\\S(?:.*\\S)?$/)).default([]).description('Tool names passed to session/create.toolAllowlist; empty sends no key').hidden(),
+    toolDenylist: z.array(z.string().pattern(/^\\S(?:.*\\S)?$/)).default([]).description('Tool names passed to session/create.toolDenylist; empty sends no key').hidden(),
     mode: z.union(['guarded'] as const).default('guarded').description('CLI permission mode (fixed: guarded; yolo auto-approves every tool call)'),
     sessionMode: z.union(['resume', 'full'] as const).default('full').description('Session mode: full replays history, resume reuses a ZCode session id'),
     sessionStorePath: z.string().default('').description('Durable sessionId to conversationId map path; empty uses DSH_HOME/zcode-provider/sessions.json'),
@@ -204,6 +225,9 @@ export function createConfigSchema(defaults: {
       visibleModels: { $description: '可见模型过滤；为空时显示全部目录条目，非空时仅显示列出的 ID' },
       modelDiscovery: { $description: '模型发现；off 表示只用静态目录（ZCode 0.17.0 无免配额的列模型命令）' },
       toolPolicy: { $description: '工具所有权：reject=拒绝 DSH 工具, zcode-owned=由 ZCode 执行, dsh-owned=由 DSH 执行' },
+      mcpBridge: { $description: '把 DSH 工具注册表经 MCP 投影给 ZCode；仅在 toolPolicy=dsh-owned 时生效' },
+      toolAllowlist: { $description: '传给 session/create.toolAllowlist 的工具名；留空则不下发该键（语义未在本机实测）' },
+      toolDenylist: { $description: '传给 session/create.toolDenylist 的工具名；留空则不下发该键（语义未在本机实测）' },
       mode: { $description: 'CLI 权限模式（固定 guarded；yolo 会自动批准所有工具调用）' },
       sessionMode: { $description: '会话模式：full=每轮完整历史, resume=复用 ZCode 会话 ID' },
       sessionStorePath: { $description: '会话映射（DSH 会话→ZCode 会话）的落盘路径；留空用 DSH_HOME/zcode-provider/sessions.json，让 resume 模式在宿主重启后仍能续话' },
@@ -229,6 +253,9 @@ export function createConfigSchema(defaults: {
       visibleModels: { $description: 'Visible models filter; empty shows every catalog entry, non-empty only shows the listed ids' },
       modelDiscovery: { $description: 'Model discovery; off keeps the static catalog (ZCode 0.17.0 has no quota-free model listing)' },
       toolPolicy: { $description: 'Tool ownership: reject, zcode-owned, dsh-owned' },
+      mcpBridge: { $description: 'Project the DSH tool registry to ZCode over MCP; only honoured when toolPolicy is dsh-owned' },
+      toolAllowlist: { $description: 'Tool names sent to session/create.toolAllowlist; empty sends no key (semantics not measured on this machine)' },
+      toolDenylist: { $description: 'Tool names sent to session/create.toolDenylist; empty sends no key (semantics not measured on this machine)' },
       mode: { $description: 'CLI permission mode (fixed to guarded; yolo auto-approves every tool call)' },
       sessionMode: { $description: 'Session mode: full or resume' },
       sessionStorePath: { $description: 'Path of the durable DSH session to ZCode session map; empty uses DSH_HOME/zcode-provider/sessions.json so resume keeps working after a host restart' },
@@ -273,6 +300,23 @@ export function configBoolean(value: unknown): boolean {
     if (typeof getter === 'function') return configBoolean((getter as () => unknown).call(value))
   }
   return false
+}
+
+/**
+ * Like {@link configBoolean}, but an absent value takes `fallback`.
+ *
+ * Needed for flags that default to *on*: `configBoolean(undefined)` is `false`,
+ * which would silently invert the documented default when a programmatic config
+ * omits the key.
+ */
+export function configFlag(value: unknown, fallback: boolean): boolean {
+  if (value === undefined || value === null) return fallback
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'object') {
+    const getter = (value as { get?: unknown }).get
+    if (typeof getter === 'function') return configFlag((getter as () => unknown).call(value), fallback)
+  }
+  return fallback
 }
 
 /**

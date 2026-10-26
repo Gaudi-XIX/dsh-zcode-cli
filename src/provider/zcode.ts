@@ -133,6 +133,7 @@ import {
   DEFAULT_ZCODE_CJS_PATH,
   ZCODE_RETRYABLE_CODES,
   configuredModels,
+  configFlag,
   filterVisibleModels,
   type Config,
   type ModelConfig,
@@ -276,6 +277,24 @@ export interface ZcodeAdapterDeps {
    * written a selection", and every field falls back to the configured value.
    */
   readonly getSelection?: (() => ZcodeSelectionLike | undefined) | undefined
+  /**
+   * Resolve the live MCP tool bridge, per turn.
+   *
+   * A lookup rather than a value: the bridge starts asynchronously while the
+   * plugin loads, so a value captured at construction would stay `undefined`
+   * for the whole host lifetime. Returning `undefined` simply means the CLI
+   * sees its own built-in tools only.
+   */
+  readonly resolveMcpBridge?: (() => ZcodeMcpBridgeLike | undefined) | undefined
+}
+
+/** The slice of `src/mcp/bridge.ts` the adapter consumes. */
+export interface ZcodeMcpBridgeLike {
+  readonly active: boolean
+  /** `session/create.mcpServers` entries; empty when the bridge is not live. */
+  readonly mcpServers: () => readonly { readonly name: string; readonly type: 'http'; readonly url: string; readonly headers: ReadonlyArray<{ readonly name: string; readonly value: string }> }[]
+  /** Point the bridge at the DSH session owning the next ZCode turn. */
+  readonly setSession: (sessionId: string) => void
 }
 
 /**
@@ -300,6 +319,7 @@ export class ZcodeAdapter extends LlmAdapter {
   private readonly retryPolicy: ResolvedRetryPolicy
   private readonly resolveWorkspaceRoot: ZcodeAdapterDeps['resolveWorkspaceRoot']
   private readonly getSelection: ZcodeAdapterDeps['getSelection']
+  private readonly resolveMcpBridge: ZcodeAdapterDeps['resolveMcpBridge']
 
   constructor(config: Config, deps: ZcodeAdapterDeps) {
     super()
@@ -307,6 +327,7 @@ export class ZcodeAdapter extends LlmAdapter {
     this.logger = debugTee(deps.logger)
     this.resolveWorkspaceRoot = deps.resolveWorkspaceRoot
     this.getSelection = deps.getSelection
+    this.resolveMcpBridge = deps.resolveMcpBridge
     this.provider = nonEmpty(config.provider) ?? 'zcode'
     this.model = nonEmpty(config.model) ?? DEFAULT_MODEL
     // One catalog builder for both the adapter and the test/tool surface: the
@@ -572,6 +593,24 @@ export class ZcodeAdapter extends LlmAdapter {
       return
     }
 
+    // Tool ownership wiring, resolved once per turn so a settings reload or a
+    // late-bound bridge port is picked up without a restart.
+    //
+    // `mcpServers` is offered only when the policy actually promises host-side
+    // execution (`dsh-owned`) and the operator left the bridge on: handing the
+    // CLI a bridge while `zcode-owned` would contradict the declared policy.
+    const bridge = this.resolveMcpBridge?.()
+    const bridgeLive = configFlag(this.config.mcpBridge, true)
+      && this.toolPolicy === 'dsh-owned'
+      && bridge?.active === true
+    const mcpServers = bridgeLive && bridge !== undefined ? [...bridge.mcpServers()] : []
+    const toolAllowlist = [...(this.config.toolAllowlist ?? [])]
+    const toolDenylist = [...(this.config.toolDenylist ?? [])]
+    // Point the endpoint at *this* conversation before the turn starts, and
+    // clear it when there is no DSH session: leaving the previous handle in
+    // place would resolve the wrong agent and run the tools on the wrong plane.
+    if (bridgeLive) bridge?.setSession(conversationId ?? '')
+
     const appServerDeps: ZcodeAppServerDeps = {
       nodePath: this.processConfig.nodePath,
       zcodeCjsPath: this.processConfig.zcodeCjsPath,
@@ -588,6 +627,9 @@ export class ZcodeAdapter extends LlmAdapter {
       // conversations (field report 2026-10-25, twice: "output exceeded
       // 8388608 bytes"). Leaving this unset lets app-server's own 256MB valve
       // apply — it guards a runaway child, not a turn budget.
+      ...(mcpServers.length === 0 ? {} : { mcpServers }),
+      ...(toolAllowlist.length === 0 ? {} : { toolAllowlist }),
+      ...(toolDenylist.length === 0 ? {} : { toolDenylist }),
     }
 
     const textParts: string[] = []

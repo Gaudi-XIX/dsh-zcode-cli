@@ -21,6 +21,8 @@
 
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process'
 
+import type { ZcodeMcpServerEntry } from '../mcp/bridge.js'
+
 import { ZcodeError } from '../provider/error-codes.js'
 import { ZcodeCredentialError } from './credential.js'
 import { terminateProcessTree } from './process.js'
@@ -55,6 +57,23 @@ export interface ZcodeAppServerDeps {
   readonly timeoutMs?: number
   readonly idleTimeoutMs?: number
   readonly maxOutputBytes?: number
+  /**
+   * MCP servers handed to `session/create` / `session/resume`.
+   *
+   * This is the DSH tool bridge's descriptor (see `src/mcp/bridge.ts`): ZCode
+   * acts as an MCP client and calls back into the host, so the tools a model
+   * sees are the host's own rather than the CLI's built-ins.
+   */
+  readonly mcpServers?: readonly ZcodeMcpServerEntry[] | undefined
+  /**
+   * Tool-surface filters passed through to the CLI verbatim.
+   *
+   * Both keys exist in the CLI's strict `session/create` schema, but what they
+   * filter — and whether the names are bare or `mcp__server__tool` — was never
+   * measured on this machine. They are configuration pass-through only.
+   */
+  readonly toolAllowlist?: readonly string[] | undefined
+  readonly toolDenylist?: readonly string[] | undefined
   /** Injectable sleep for tests: microtask-scheduled waits stay off the real
    * timer wheel, so a 60-probe readiness loop can't interact with the test
    * runner's timer bookkeeping (the OOM in `tests/app-server.test.mjs`). */
@@ -367,8 +386,37 @@ class AppServerSession {
       })
       return
     }
+    if (method === 'interaction/requestPermission') {
+      // Fail closed, deliberately.
+      //
+      // The CLI asks its client to approve a tool call. This provider runs
+      // headless and has no approval channel to offer, so the only safe answer
+      // is "no": approving here would execute a tool the user never saw, which
+      // is exactly the fail-open hole the `-p` path used to close by killing
+      // the process.
+      //
+      // Response shape is the CLI's own `permission response` schema (`MF` in
+      // `zcode.cjs`): a strict object with `decision` drawn from
+      // allow|deny|escalate|modify and an optional `reason`. Extra fields are
+      // rejected, so nothing else is sent.
+      const params = (message.params ?? {}) as { toolName?: unknown; requestId?: unknown }
+      const toolName = typeof params.toolName === 'string' ? params.toolName : '<unknown tool>'
+      this.log({ kind: 'zcode.appserver.permission.denied', toolName, requestId: params.requestId })
+      this.sendLine({
+        id,
+        result: {
+          decision: 'deny',
+          reason: `DSH has no approval channel for ZCode tool calls, so "${toolName}" was denied. `
+            + 'Route tools through the DSH MCP bridge instead of letting the CLI run them.',
+        },
+      })
+      return
+    }
     this.log({ kind: 'zcode.appserver.callback.unhandled', method })
     // Unknown callbacks get a minimal ack so the turn is not blocked on them.
+    // Known gap: `interaction/requestUserInput` also lands here, and an empty
+    // ack may leave the CLI waiting. Its response schema was not copied, and
+    // inventing one is worse than acking — see `docs/zcode-a3-tool-bridge.md`.
     this.sendLine({ id, result: {} })
   }
 
@@ -540,9 +588,21 @@ class AppServerSession {
 
   async openSession(resumeSessionId: string | undefined): Promise<void> {
     const workspace = { workspacePath: this.deps.workspacePath, workspaceKey: this.deps.workspaceKey }
+    const servers = this.deps.mcpServers ?? []
+    // Only the keys that are actually set: both request schemas are `.strict()`,
+    // so an empty array is not the same as an absent key (an explicit `[]` would
+    // also mean "clear the list" on resume, which is not what an unconfigured
+    // bridge should say).
+    const toolSurface = {
+      ...(servers.length === 0
+        ? {}
+        : { mcpServers: servers.map(entry => ({ ...entry, headers: entry.headers.map(header => ({ ...header })) })) }),
+      ...(this.deps.toolAllowlist === undefined ? {} : { toolAllowlist: [...this.deps.toolAllowlist] }),
+      ...(this.deps.toolDenylist === undefined ? {} : { toolDenylist: [...this.deps.toolDenylist] }),
+    }
     const reply = resumeSessionId !== undefined
-      ? await this.request('session/resume', { sessionId: resumeSessionId, workspace })
-      : await this.request('session/create', { workspace })
+      ? await this.request('session/resume', { sessionId: resumeSessionId, workspace, ...toolSurface })
+      : await this.request('session/create', { workspace, ...toolSurface })
     const result = reply.result as {
       session?: { sessionId?: unknown; settings?: {
         thoughtLevel?: { available?: { value?: unknown }[] }
