@@ -2,29 +2,33 @@
 
 DSH 的 **safe provider**：把本机 ZCode CLI（`zcode.cjs`，ZCode 0.17.0）作为一个 `zcode` 路由接进 DSH 的 LLM 层。一个 `LlmAdapter`，无运行时依赖（`dependencies` 为空），Node ≥ 22。
 
-> **safe 在哪**：插件自己从不向上游发一个网络请求——所有流量都由官方二进制自带 ed25519 签名发起；不碰 ZCode 的账号密码，不伪造客户端特征，零风控、零封号面。
+**这个插件的三件事（三件全部成立，第三件分两步走）：**
+
+1. **完全合规** ✓ —— 插件自己从不向上游发一个网络请求：所有流量由官方二进制自带 ed25519 签名发起；不碰 ZCode 的账号密码，不伪造客户端特征。零风控、零封号面。
+2. **吃到 ZCode 账号的官方额度** ✓ —— 付费套餐走官方签名通道；免费起步套餐经 app-server 账号注入，且注入层已**端到端激活**（对照官方桌面客户端的投递载荷修复了 canonical revision、connectionKey 与 runtime 上报的 builtin tag，实测模型可在免费套餐上跑完整轮次）。消耗与官方客户端同池同规则，不需要任何 API Key。
+3. **抛弃 ZCode 的 harness 换 DSH 的：协议已通，产品化在路上** —— 实测（probe5，2026-10-26）：免费套餐上的模型**可以经 MCP 桥调用工具**，与姊妹插件 dsh-agy-cli 的桥同构。「ZCode 不开放工具投影」的旧判断已被实测推翻。当前版本 harness 仍归 ZCode（DSH 提供壳层：会话组织、重试、错误分类、随时切走）；把 DSH 工具桥产品化（工具投影 + 审批/沙箱经 DSH ToolRuntime）是下一步。在那之前，**多步工具任务请走 [`dsh-agy-cli`](https://github.com/Gaudi-XIX/dsh-agy-cli)**（harness 已 100% 归 DSH）。
 
 ## 与其他服务商插件的区别（先读这个）
 
 DSH 生态里接第三方模型的插件，本质差异只有一个问题：**谁来当 harness**。harness 指「工具怎么执行、多步循环怎么走、上下文怎么管」这三件事。两个插件正好站在光谱两端：
 
-| | [dsh-agy-provider](https://github.com/Gaudi-XIX/dsh-agy-provider) | **本插件** | 抽 token 反代类插件 |
+| | [dsh-agy-cli](https://github.com/Gaudi-XIX/dsh-agy-cli)（姊妹插件） | **本插件（当前版本）** | 抽 token 反代类插件 |
 |---|---|---|---|
 | 模型额度来源 | AGY CLI 官方二进制 | ZCode CLI 官方二进制 | 逆向出的私token |
-| **harness 归属** | **DSH 100% 主导** | **ZCode CLI 主导** | 插件自建 |
+| **harness 归属** | **DSH 100% 主导** | **暂归 ZCode CLI**（MCP 工具桥已实测可通，产品化在路上） | 插件自建 |
 | 工具执行 | DSH 工具管线（审批/沙箱全生效） | ZCode 内部工具（`--mode guarded` 委托给它） | 插件自实现 |
 | 网络请求 | 官方二进制签发 | 官方二进制签发 | 插件伪造客户端直连 |
 | 风控/封号面 | 无 | 无 | 有（如 ZCode 通道 `405 [3012]` 惩罚阶梯） |
-| DSH harness 增强（审批、沙箱、子代理、压缩） | **全部生效** | **够不着**（进程边界外） | 部分自实现 |
+| DSH harness 增强（审批、沙箱、子代理、压缩） | **全部生效** | **暂够不着**（工具桥产品化后生效） | 部分自实现 |
 
-**为什么本插件是「CLI 主导」而不是 agy 那种「DSH 主导」——这是上游接口决定的，不是实现取舍。** AGY CLI 暴露了 stream-json 事件协议和结构化 tool-call 信封，所以 agy 插件能把 DSH 的工具 schema 投影进去、把模型要调的工具拦截下来交回 DSH 执行。ZCode 0.17.0 没有这种通道：它只卖「跑一轮任务」（`-p` 一次性 / app-server 会话），不卖裸模型接口，也不吐工具投影；模型额度又绑定在官方二进制的签名通道上，HTTP 直连会被风控打回。**接口没开的门，插件侧任何实现都变不出来。** 所以本插件的形态是：整轮任务委托给 ZCode，DSH 做好的那一层壳（会话组织、重试、超时、错误分类、UI、随时切走）。
+**为什么当前版本还是「CLI 主导」——旧判断与它的实测推翻。** AGY CLI 暴露了 stream-json 事件协议和结构化 tool-call 信封，所以 agy 插件能把 DSH 的工具 schema 投影进去、把模型要调的工具拦截下来交回 DSH 执行。本插件最初据此判断「ZCode 没有这种通道」：它只卖「跑一轮任务」（`-p` 一次性 / app-server 会话），不卖裸模型接口，额度又绑定官方签名通道。**这个判断已被实测推翻**（2026-10-26 probe5：免费套餐上的模型经 MCP 桥成功调用工具，与 agy 的桥同构）——app-server 通道具备 MCP 工具桥能力，DSH 工具桥的产品化（工具投影、审批、沙箱接 DSH ToolRuntime）是明确的下一步。在那之前，本插件的形态是：整轮任务委托给 ZCode，DSH 做好壳层（会话组织、重试、超时、错误分类、UI、随时切走）。
 
 ### 与市场同类的对照
 
 DSH 市场里已有两条同走官方 CLI 委托路线的 ZCode 插件，都是认真维护的作品，收录本插件前先说清它们为什么不同：
 
 - [`dsh-zcode-cli-proxy`](https://github.com/kyle123740/dsh-zcode-cli-proxy) / [`dsh-zcode-plan-bridge`](https://github.com/tangyixiao/dsh-zcode-plan-bridge)：单路线常驻 app-server（Start Plan 账号注入），真流式，跟进 ZCode CLI 新版（3.16.x）与 DSH 0.2.1 更激进。**适合想让 ZCode 会话常驻、跟进新 CLI 的用户。**
-- **本插件**锚定已实测的 ZCode 0.17.0 + DSH 0.2.0-rc.2，做的是另一件事：**付费（`-p` 一次性）与免费（app-server 注入）双路线**，且把两条路线的行为逐一对齐（resume 语义、死会话自愈、准入检查、错误码），以 171 例 node --test 测试和三处计数的门禁锁死，每条行为有契约文档（`docs/dsh-provider-contract.md`）背书。**适合要付费/免费可切、看重可测契约与 fail-closed 语义的用户。**
+- **本插件**锚定已实测的 ZCode 0.17.0 + DSH 0.2.0-rc.2，做的是另一件事：**付费（`-p` 一次性）与免费（app-server 注入）双路线**，且把两条路线的行为逐一对齐（resume 语义、死会话自愈、准入检查、错误码），以 173 例 node --test 测试和三处计数的门禁锁死，每条行为有契约文档（`docs/dsh-provider-contract.md`）背书。**适合要付费/免费可切、看重可测契约与 fail-closed 语义的用户。**
 
 ## 优势（这套设计换来什么）
 
@@ -36,7 +40,7 @@ DSH 市场里已有两条同走官方 CLI 委托路线的 ZCode 插件，都是�
 
 ## 劣势与代价（诚实清单）
 
-- **DSH 的 harness 增强够不着它**：审批 UI、沙箱策略、子代理编排对这条路线全部无效。工具在 ZCode 内部跑，`--mode guarded` 的非交互行为未实测（见已知限制）。**多步工具任务请用 harness 主导的 provider（如 dsh-agy-provider），这条路线适合纯文本问答。**
+- **DSH 的 harness 增强暂时够不着它**：审批 UI、沙箱策略、子代理编排对这条路线暂不生效。工具在 ZCode 内部跑，`--mode guarded` 的非交互行为未实测（见已知限制）。MCP 工具桥协议已实测可通（probe5），DSH 工具桥产品化后此项撤销；在那之前，**多步工具任务请用 harness 主导的姊妹插件 [`dsh-agy-cli`](https://github.com/Gaudi-XIX/dsh-agy-cli)，这条路线适合纯文本问答。**
 - **一轮一进程**：每轮冷启动一个 CLI 子进程，首字延迟 1~3 秒；免费路线还要多付 app-server 就绪探针的时间。
 - **prompt 走 argv 有 30,000 字符硬顶**（Windows 命令行上限）：`-p` 路线超长历史直接报错而不截断——宁可失败不答错题。免费路线走 stdin 无此限制。
 - **模型切换受限**：CLI 没有 `--model`/`--effort`，付费路线下模型目录是静态的两个 id；免费路线经 app-server 真实下发。
